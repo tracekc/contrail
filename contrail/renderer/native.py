@@ -215,6 +215,9 @@ class NativeRenderer:
         self.chase_scale: Optional[float] = None
         self._state_mtime: float = -1.0
 
+        # Cache for skia.Image objects loaded from local photo files. Key: file path str.
+        self._photo_image_cache: dict[str, Optional[skia.Image]] = {}
+
         self._init_view(None)
 
     # ── camera / projection helpers ──────────────────────────────────
@@ -499,6 +502,21 @@ class NativeRenderer:
                        skia.Paint(Color=color, Style=skia.Paint.kFill_Style, AntiAlias=True))
             c.restore()
 
+    def _load_photo(self, path: Optional[str]) -> Optional[skia.Image]:
+        """Load a photo from disk, caching by path. Returns None on any failure."""
+        if not path:
+            return None
+        if path in self._photo_image_cache:
+            return self._photo_image_cache[path]
+        try:
+            raw = Path(path).read_bytes()
+            img = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(raw))
+            self._photo_image_cache[path] = img
+            return img
+        except Exception:
+            self._photo_image_cache[path] = None
+            return None
+
     # ── chrome (HTML/CSS overlays ported to Skia draws) ──────────────
     def _draw_chrome(self, c: skia.Canvas, now: float) -> None:
         st = self.latest_state
@@ -532,28 +550,138 @@ class NativeRenderer:
         # ---- Tracking panel (top-right, below badge) ----
         t = st.get("tracking")
         if t and t.get("callsign"):
-            px, py, pw = WIDTH - 18 - 240, 58, 240
-            rows = [("Route", t.get("route") or "—"),
-                    ("Altitude", f"{t['alt']:,} ft" if t.get("alt") is not None else "—"),
-                    ("Speed", f"{t['speed']} kt" if t.get("speed") is not None else "—"),
-                    ("Squawk", t.get("squawk") or "—")]
-            ph = 62 + len(rows) * 16 + (18 if t.get("emergency") else 0)
+            px, py, pw = WIDTH - 18 - 260, 58, 260
+
+            # Measure dynamic height before drawing background.
+            has_photo = bool(t.get("photo_path"))
+            has_reg = bool(t.get("registration"))
+            has_age = bool(t.get("built_year"))
+            has_route = bool(t.get("route"))
+            has_emergency = bool(t.get("emergency"))
+            data_rows = [
+                ("Altitude", f"{t['alt']:,} ft" if t.get("alt") is not None else "—"),
+                ("Speed", f"{t['speed']} kt" if t.get("speed") is not None else "—"),
+                ("Squawk", t.get("squawk") or "—"),
+            ]
+            ph = (16 + 20 + 14       # tag + callsign + type
+                  + 96               # photo box + gap
+                  + (14 if (has_reg or has_age) else 0)   # badges row
+                  + (12 if t.get("photo_credit") else 0)  # photo credit
+                  + 8                # section divider gap
+                  + (14 * 2 if has_route else 0)           # two airport name lines
+                  + (8 if has_route else 0)                # gap after route
+                  + len(data_rows) * 16
+                  + (20 if has_emergency else 0)
+                  + 12)              # bottom padding
+
             c.drawRoundRect(skia.Rect.MakeXYWH(px, py, pw, ph), 4, 4, skia.Paint(Color=PANEL_BG, AntiAlias=True))
             c.drawRect(skia.Rect.MakeXYWH(px, py, 3, ph), skia.Paint(Color=RED))
-            ix, iy = px + 12, py + 16
+
+            ix, iy = px + 12, py + 14
+            # tag
             c.drawString("TRACKING NOW", ix, iy, f_label, skia.Paint(Color=TEXT_DIM, AntiAlias=True))
             iy += 18
+            # callsign
             c.drawString(_safe(t["callsign"]), ix, iy, _font(16, bold=True), skia.Paint(Color=WHITE, AntiAlias=True))
-            iy += 16
-            c.drawString(_safe(t.get("type") or "Unknown type"), ix, iy, f_small, skia.Paint(Color=TEXT_DIM, AntiAlias=True))
-            iy += 16
-            for label, val in rows:
+            iy += 18
+            # type (may overlap operator — prefer operator when available)
+            type_str = _safe(t.get("operator") or t.get("type") or "Unknown type")
+            c.drawString(type_str, ix, iy, f_small, skia.Paint(Color=TEXT_DIM, AntiAlias=True))
+            iy += 14
+
+            # Photo box (90px tall, full panel width minus side padding)
+            photo_rect = skia.Rect.MakeXYWH(ix, iy, pw - 24, 90)
+            photo_img = self._load_photo(t.get("photo_path"))
+            if photo_img:
+                # Scale-to-fill crop into photo_rect
+                iw, ih = photo_img.width(), photo_img.height()
+                box_w, box_h = pw - 24, 90
+                scale = max(box_w / iw, box_h / ih)
+                sw, sh = iw * scale, ih * scale
+                src_rect = skia.Rect.MakeXYWH(0, 0, iw, ih)
+                dst_rect = skia.Rect.MakeXYWH(
+                    ix + (box_w - sw) / 2, iy + (box_h - sh) / 2, sw, sh
+                )
+                c.save()
+                c.clipRRect(skia.RRect.MakeRectXY(photo_rect, 3, 3))
+                c.drawImageRect(photo_img, src_rect, dst_rect,
+                                skia.SamplingOptions(skia.FilterMode.kLinear), None)
+                c.restore()
+            else:
+                # Placeholder: dark box with registration or fallback text
+                c.drawRoundRect(photo_rect, 3, 3,
+                                skia.Paint(Color=_c("#141b2d"), AntiAlias=True))
+                placeholder = _safe(t.get("registration") or t.get("callsign") or "—")
+                pw_txt = _font(12, bold=True).measureText(placeholder)
+                c.drawString(placeholder, ix + (pw - 24 - pw_txt) / 2, iy + 42,
+                             _font(12, bold=True), skia.Paint(Color=TEXT_DIM, AntiAlias=True))
+                no_ph = "No photo found"
+                no_w = f_small.measureText(no_ph)
+                c.drawString(no_ph, ix + (pw - 24 - no_w) / 2, iy + 58,
+                             f_small, skia.Paint(Color=_c("#4a5568"), AntiAlias=True))
+            iy += 94
+
+            # Photo credit
+            credit = t.get("photo_credit")
+            if credit:
+                credit_str = _safe(f"Photo: {credit}")
+                c.drawString(credit_str, ix, iy, _font(9), skia.Paint(Color=_c("#4a5568"), AntiAlias=True))
+                iy += 12
+
+            # Reg + age badges
+            if has_reg or has_age:
+                badge_x = ix
+                badge_h = 16
+                f_badge_sm = _font(9, bold=True)
+                for badge_txt in filter(None, [
+                    t.get("registration"),
+                    f"Est. {t['built_year']}" if has_age else None,
+                ]):
+                    badge_txt = _safe(badge_txt)
+                    btw = f_badge_sm.measureText(badge_txt)
+                    bw = btw + 12
+                    c.drawRoundRect(skia.Rect.MakeXYWH(badge_x, iy - 11, bw, badge_h),
+                                    3, 3, skia.Paint(Color=_c("#1e2d42"), AntiAlias=True))
+                    c.drawString(badge_txt, badge_x + 6, iy, f_badge_sm,
+                                 skia.Paint(Color=TEXT, AntiAlias=True))
+                    badge_x += bw + 6
+                iy += 14
+
+            # Divider gap
+            iy += 8
+
+            # Airport names (route)
+            if has_route:
+                # _safe converts "→" to "->"; split on that after normalization.
+                route_safe = _safe(t["route"])
+                route_parts = route_safe.split("->", 1)
+                if len(route_parts) == 2:
+                    origin_str = route_parts[0].strip()
+                    dest_str = route_parts[1].strip()
+                    max_chars = 28
+                    if len(origin_str) > max_chars:
+                        origin_str = origin_str[:max_chars - 2] + ".."
+                    if len(dest_str) > max_chars:
+                        dest_str = dest_str[:max_chars - 2] + ".."
+                    c.drawString("FROM", ix, iy, f_label, skia.Paint(Color=TEXT_DIM, AntiAlias=True))
+                    c.drawString(origin_str, ix + 36, iy, _font(10), skia.Paint(Color=TEXT, AntiAlias=True))
+                    iy += 14
+                    c.drawString("TO", ix, iy, f_label, skia.Paint(Color=TEXT_DIM, AntiAlias=True))
+                    c.drawString(dest_str, ix + 36, iy, _font(10), skia.Paint(Color=TEXT, AntiAlias=True))
+                    iy += 8
+                else:
+                    c.drawString(route_safe, ix, iy, f_small, skia.Paint(Color=TEXT, AntiAlias=True))
+                    iy += 14
+
+            # Data rows (altitude / speed / squawk)
+            for label, val in data_rows:
                 val = _safe(val)
                 c.drawString(label, ix, iy, f_small, skia.Paint(Color=TEXT_DIM, AntiAlias=True))
                 vw = f_small.measureText(val)
                 c.drawString(val, px + pw - 12 - vw, iy, f_small, skia.Paint(Color=TEXT, AntiAlias=True))
                 iy += 16
-            if t.get("emergency"):
+
+            if has_emergency:
                 c.drawString("EMERGENCY IN PROGRESS", ix, iy + 2, _font(11, bold=True),
                              skia.Paint(Color=RED, AntiAlias=True))
 

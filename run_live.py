@@ -29,7 +29,9 @@ from contrail.config import Config
 from contrail.data.regions import REGIONS
 from contrail.detect import EventDetector
 from contrail.director import Director, ScriptLine
-from contrail.enrich import enrich_all
+from contrail.enrich import enrich_all, lookup_aircraft, lookup_route
+from contrail.enrich_cache import EnrichmentCache
+from contrail import photo_cache
 from contrail.ingest import AdsbClient
 from contrail.models import Aircraft
 from contrail.narrate import Narrator, estimate_speech_seconds, play
@@ -66,6 +68,8 @@ def _next_rotation_delay() -> float:
     return random.uniform(ROTATE_MIN_S, ROTATE_MAX_S)
 
 log = logging.getLogger("contrail.live")
+
+_enrich_cache = EnrichmentCache()
 
 
 def _dedupe(aircraft: list[Aircraft]) -> list[Aircraft]:
@@ -142,15 +146,40 @@ def _write_state(aircraft, line, candidates, region_count, bounds=None) -> None:
     tracking = None
     if line and line.aircraft and line.aircraft.lat is not None:
         ac = line.aircraft
+        ac_data = lookup_aircraft(ac.hex, _enrich_cache) if ac.hex else None
+        rt_data = lookup_route(ac.callsign, _enrich_cache)
+
+        # Build route display string from enriched names or fall back to IATAs.
+        route_str = None
+        if rt_data:
+            o_name = rt_data.get("origin_name") or rt_data.get("origin_iata") or rt_data.get("origin_icao")
+            d_name = rt_data.get("dest_name") or rt_data.get("dest_iata") or rt_data.get("dest_icao")
+            if o_name and d_name:
+                route_str = f"{o_name} → {d_name}"
+
+        photo_url = (ac_data or {}).get("photo_url")
+        photo_path = None
+        if ac.hex and photo_url:
+            p = photo_cache.get_photo_path(ac.hex, photo_url)
+            photo_path = str(p) if p else None
+
         tracking = {
             "callsign": ac.callsign or ac.hex,
             "type": ac.type_desc or ac.type_code or "",
-            "route": None,
+            "route": route_str,
             "alt": ac.altitude,
             "speed": round(ac.ground_speed) if ac.ground_speed else None,
             "squawk": ac.squawk,
             "emergency": line.segment == "event",
             "lat": ac.lat, "lon": ac.lon,
+            # enrichment fields (None until background fetch completes)
+            "registration": (ac_data or {}).get("registration"),
+            "built_year": (ac_data or {}).get("built_year"),
+            "operator": (ac_data or {}).get("operator"),
+            "origin_iata": (rt_data or {}).get("origin_iata"),
+            "dest_iata": (rt_data or {}).get("dest_iata"),
+            "photo_path": photo_path,
+            "photo_credit": (ac_data or {}).get("photo_credit"),
         }
 
     alerts = [c.headline for c in candidates
