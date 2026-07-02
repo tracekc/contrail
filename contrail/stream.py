@@ -120,11 +120,11 @@ class LiveStreamer:
     def _ffmpeg_cmd(self, fifo: str) -> list[str]:
         cmd = [
             "ffmpeg", "-y",
-            # video: JPEG frames on stdin (JPEG encodes ~5x faster than PNG)
+            # JPEG frames from native Skia renderer or Playwright screenshot
             "-f", "image2pipe", "-vcodec", "mjpeg", "-framerate", str(self.fps), "-i", "pipe:0",
             # audio: raw PCM from the FIFO
             "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS), "-i", fifo,
-            "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+            "-c:v", "libx264", "-preset", "veryfast",
             "-pix_fmt", "yuv420p", "-g", str(self.fps * 2), "-b:v", "4500k",
             "-c:a", "aac", "-b:a", "128k", "-ar", str(SAMPLE_RATE),
         ]
@@ -171,9 +171,9 @@ class LiveStreamer:
                 if end and time.monotonic() >= end:
                     break
                 renderer.poll_state(STATE_JSON)
-                jpeg = renderer.render_frame(quality=75)
+                frame = renderer.render_frame(quality=92)
                 try:
-                    self._proc.stdin.write(jpeg)
+                    self._proc.stdin.write(frame)
                 except (BrokenPipeError, ValueError):
                     break
                 deadline += interval
