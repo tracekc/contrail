@@ -1,0 +1,20 @@
+{
+  "host": "ks-Mac-mini.local",
+  "processor": "arm",
+  "cpu_count": 10,
+  "timestamp": "2026-07-02T19:21:08Z",
+  "tier": "micro",
+  "scenario": "empty_sky",
+  "duration": 25.0,
+  "metrics": {
+    "p50_ms": 2.353270538151264,
+    "p99_ms": 2.762665506452322,
+    "cache_hit_p50_ms": 2.325396053493023,
+    "cache_hit_p99_ms": 2.7573225088417526,
+    "cache_bust_p50_ms": 7.458186708390713,
+    "cache_bust_p99_ms": 9.082915931940079,
+    "jpeg_encode_p50_ms": 1.836854498833418,
+    "jpeg_encode_p99_ms": 2.209224011749029,
+    "mean_frame_size_bytes": 29832.0
+  }
+}

@@ -8,3 +8,4 @@ skia-python>=144.0
 # Optional: free offline TTS (TTS_PROVIDER=local). Download a voice with:
 #   python -m piper.download_voices en_GB-alan-medium --download-dir voices
 piper-tts>=1.4
+edge-tts>=6.0

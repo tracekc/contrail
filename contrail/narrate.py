@@ -1,8 +1,8 @@
 """Narrator: turn a script line into spoken audio.
 
 Provider switch via TTS_PROVIDER: openai (default, cheap) | elevenlabs (nicer
-voice) | local (stub). Produces an audio file; the orchestrator queues it for
-the stream, or plays it locally during development.
+voice) | local (stub) | edge (Microsoft Neural). Produces an audio file; the
+orchestrator queues it for the stream, or plays it locally during development.
 """
 
 from __future__ import annotations
@@ -41,6 +41,8 @@ class Narrator:
             self._synth_elevenlabs(text, out_path)
         elif self.provider == "local":
             self._synth_local(text, out_path)
+        elif self.provider == "edge":
+            self._synth_edge(text, out_path)
         else:
             raise ValueError(f"Unknown TTS_PROVIDER: {self.provider!r}")
         return out_path
@@ -104,6 +106,13 @@ class Narrator:
             for chunk in audio:
                 if chunk:
                     f.write(chunk)
+
+    def _synth_edge(self, text: str, out_path: str) -> None:
+        import asyncio
+        import edge_tts
+
+        voice = os.getenv("EDGE_TTS_VOICE", "en-GB-RyanNeural")
+        asyncio.run(edge_tts.Communicate(text, voice).save(out_path))
 
 
 def play(path: str) -> None:

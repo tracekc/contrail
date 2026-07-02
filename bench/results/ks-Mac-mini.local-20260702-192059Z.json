@@ -1,0 +1,17 @@
+{
+  "host": "ks-Mac-mini.local",
+  "processor": "arm",
+  "cpu_count": 10,
+  "timestamp": "2026-07-02T19:20:59Z",
+  "tier": "pipeline",
+  "scenario": "moderate_50",
+  "duration": 15.0,
+  "metrics": {
+    "p50_ms": 79.96458280831575,
+    "p95_ms": 277.9145962558687,
+    "p99_ms": 332.58952498436037,
+    "max_ms": 1430.1665425300598,
+    "stalls": 41,
+    "ffmpeg_speed": 0.9934150943396226
+  }
+}
