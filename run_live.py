@@ -297,6 +297,7 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
     bounds = _region_bounds(cur_region)
     aircraft, region_count = _fetch(client, cur_region)
     last_poll = time.time()
+    emergency_redirect = False  # True while we've shifted the map to a global emergency
 
     while not stop.is_set():
         now = time.time()
@@ -340,6 +341,42 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
         ctx = {"region_count": region_count, "region_name": region.name}
         candidates = detector.detect(aircraft, ctx)
         line = director.next_line(candidates, ctx, aircraft)
+
+        # ── global emergency redirect ─────────────────────────────────────────
+        # When the incident tracker locks onto an emergency aircraft that lies
+        # outside the current map view, shift the whole channel to that location:
+        # update bounds (what the map renders), cur_region (what the next fetch
+        # pulls), and do an immediate refetch so the area fills with real traffic.
+        # When the incident clears, return to the scheduled named region.
+        eac = director._incident.last_ac if director._incident.active else None
+        if eac and eac.lat is not None and eac.lon is not None:
+            w, s, e, n = bounds
+            outside = not (s <= eac.lat <= n and w <= eac.lon <= e)
+            if outside and not emergency_redirect:
+                log.info(
+                    "emergency redirect: incident at %.2f,%.2f (%s) outside current region — shifting",
+                    eac.lat, eac.lon, eac.hex,
+                )
+                cur_region = (eac.lat, eac.lon, 300.0)
+                bounds = _region_bounds(cur_region)
+                new_ac, new_rc = _fetch(client, cur_region)
+                if new_ac:
+                    aircraft, region_count = new_ac, new_rc
+                last_poll = time.time()
+                emergency_redirect = True
+
+        if not director._incident.active and emergency_redirect:
+            log.info("emergency redirect ended; returning to %s", region.name)
+            cur_region = region.tuple
+            bounds = _region_bounds(cur_region)
+            new_ac, new_rc = _fetch(client, cur_region)
+            if new_ac:
+                aircraft, region_count = new_ac, new_rc
+            last_poll = time.time()
+            region_started = time.time()
+            emergency_redirect = False
+        # ─────────────────────────────────────────────────────────────────────
+
         _write_state(aircraft, line, candidates, region_count, bounds)
 
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
