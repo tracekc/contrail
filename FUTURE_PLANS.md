@@ -15,9 +15,11 @@ Ratings are rough L/M/H judgments. Cost blends ongoing $ and build effort.
 | Real ATC audio | Real controller/pilot voices for the focus region — authenticity/drama | Med | High | Low–Med | 🔴 |
 | Anchor personality | Deepen Miles: running bits, opinions, live-chat interaction | High | Med–High | Low | 🟡 |
 | Real map basemap (§2) | MapLibre + self-hosted PMTiles; detailed tiles so motion reads | Med | Med | Med–High | 🔴 |
+| Hosting & cost for top-notch visuals (§4) | Basic hosting migrated to Hetzner CX33 (~$9.59/mo); GPU path still needed for real map tier | Med | Med | Med–High | 🟢 |
 | Real stats | Make viewer count / "busiest airport" chips real, or hide them | High | Low–Med | Low | 🔴 |
 | Number-reading fix | Stop odd-altitude mangling ("thirteen-eight-five-zero") | High | Low | Low | 🔴 |
 | Temp-file cleanup | Delete narration .wav clips after ffmpeg reads them | High | Low (reliability) | Low | 🔴 |
+| Edge TTS | Replaced Piper ONNX; zero local CPU, eliminates stop-motion stalls | High | High | Free | 🟢 |
 
 Rough priority (see full reasoning at bottom): data enrichment → memory → real ATC → personality → real map. The last four rows are small hygiene/quality fixes to fold in opportunistically.
 
@@ -216,6 +218,8 @@ are only necessary if we want guaranteed schedule coverage or ever monetize.
 
 ## 4. Hosting & cost for top-notch visuals 🔴
 
+**Current state (2026-07-02):** Basic streaming migrated to Hetzner CX33 (4 vCPU, 8 GB, Nuremberg, ~$9.59/mo). TTS switched from local Piper ONNX to Edge TTS (Microsoft Neural, zero local CPU). Stream runs at speed=1.04x, Excellent health on YouTube. The GPU path below is only relevant when pursuing the real map basemap (§2).
+
 Relevant only if pursuing the real map (§2) at 1080p/high-fps. Summary: the GPU
 is the *cheap* part — **bandwidth is the real cost**, and it decides the provider.
 
@@ -280,4 +284,4 @@ Add LLM (Haiku) ~$50–150/mo; TTS $0 (Piper runs on the box). All-in:
 3. Fix the format's core weakness: **memory (§1)** + **real ATC audio**.
 4. Only if positioning as ambient beauty: **real map (§2)**.
 5. Harden for 24/7 (supervision/failover exist; add temp cleanup, etc.).
-6. Cost discipline — done (local Piper TTS, home hardware).
+6. Cost discipline — done (Edge TTS via Microsoft Neural cloud, Hetzner CX33 ~$9.59/mo).
