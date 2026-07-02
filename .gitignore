@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editor / local tooling
+.claude/settings.local.json
+
+# Generated runtime artifacts
+skywatch.log
+*.log
+contrail/renderer/state.json
+contrail/renderer/test_frame.png
+
+# Generated media / test output
+*.mp4
+
+# Large downloadable models (see README for how to fetch)
+voices/*.onnx

@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Skywatch — Contrail broadcast scene</title>
+<style>
+  :root {
+    --bg: #0a0e1a;
+    --land: #1b2536;
+    --graticule: #2a3346;
+    --cyan: #4ad0e0;
+    --red: #e0584a;
+    --live-red: #c0392b;
+    --text: #cfd6e4;
+    --text-dim: #7e8aa3;
+    --panel-bg: rgba(10, 14, 26, 0.82);
+    --panel-border: rgba(255, 255, 255, 0.08);
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 1280px;
+    height: 720px;
+    background: var(--bg);
+    overflow: hidden;
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    color: var(--text);
+  }
+
+  #stage {
+    position: relative;
+    width: 1280px;
+    height: 720px;
+    background: var(--bg);
+  }
+
+  #marker-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 1280px;
+    height: 720px;
+  }
+
+  /* ---------- LIVE badge ---------- */
+  #live-badge {
+    position: absolute;
+    top: 18px;
+    right: 18px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--live-red);
+    color: #fff;
+    padding: 6px 12px 6px 10px;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  }
+
+  #live-badge .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #fff;
+    animation: blink 1.4s ease-in-out infinite;
+  }
+
+  #live-badge .viewers {
+    font-weight: 400;
+    opacity: 0.92;
+    letter-spacing: normal;
+    font-size: 12px;
+    border-left: 1px solid rgba(255, 255, 255, 0.35);
+    padding-left: 8px;
+    margin-left: 2px;
+  }
+
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+  }
+
+  /* ---------- Tracking now panel ---------- */
+  #tracking-panel {
+    position: absolute;
+    top: 58px;
+    right: 18px;
+    width: 240px;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-left: 3px solid var(--red);
+    border-radius: 4px;
+    padding: 10px 12px;
+    font-size: 12px;
+    display: none;
+  }
+
+  #tracking-panel.visible { display: block; }
+
+  #tracking-panel .label {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+
+  #tracking-panel .callsign {
+    font-size: 16px;
+    font-weight: 700;
+    color: #fff;
+    margin-bottom: 2px;
+  }
+
+  #tracking-panel .type {
+    color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+
+  #tracking-panel .row {
+    display: flex;
+    justify-content: space-between;
+    padding: 1px 0;
+    color: var(--text);
+  }
+
+  #tracking-panel .row span:first-child {
+    color: var(--text-dim);
+  }
+
+  #tracking-panel .emergency-flag {
+    margin-top: 6px;
+    color: var(--red);
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    font-size: 11px;
+  }
+
+  /* ---------- Stat chips, bottom-left ---------- */
+  #stat-chips {
+    position: absolute;
+    left: 18px;
+    bottom: 84px;
+    display: flex;
+    gap: 8px;
+  }
+
+  .chip {
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-size: 12px;
+    min-width: 120px;
+  }
+
+  .chip .chip-label {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 9px;
+    color: var(--text-dim);
+  }
+
+  .chip .chip-value {
+    font-size: 14px;
+    font-weight: 700;
+    color: #fff;
+  }
+
+  /* ---------- Narrating indicator ---------- */
+  #narrating {
+    position: absolute;
+    left: 18px;
+    bottom: 128px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  #narrating .bars {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 12px;
+  }
+
+  #narrating .bars i {
+    width: 3px;
+    background: var(--cyan);
+    display: block;
+    animation: bar-pulse 1s ease-in-out infinite;
+  }
+
+  #narrating .bars i:nth-child(1) { height: 4px; animation-delay: 0s; }
+  #narrating .bars i:nth-child(2) { height: 10px; animation-delay: 0.15s; }
+  #narrating .bars i:nth-child(3) { height: 6px; animation-delay: 0.3s; }
+
+  #narrating.idle .bars i {
+    animation: none;
+    height: 3px;
+    background: var(--text-dim);
+  }
+
+  @keyframes bar-pulse {
+    0%, 100% { height: 3px; }
+    50% { height: 12px; }
+  }
+
+  /* ---------- Lower-third caption strip ---------- */
+  #caption-strip {
+    position: absolute;
+    left: 0;
+    bottom: 28px;
+    width: 1280px;
+    display: flex;
+    align-items: stretch;
+    box-shadow: 0 -2px 14px rgba(0, 0, 0, 0.5);
+  }
+
+  #caption-strip .flight-desk {
+    background: var(--live-red);
+    color: #fff;
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 0.06em;
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    white-space: nowrap;
+  }
+
+  #caption-strip .caption-text {
+    flex: 1;
+    background: rgba(10, 14, 26, 0.92);
+    border-top: 1px solid var(--panel-border);
+    border-bottom: 1px solid var(--panel-border);
+    color: #fff;
+    font-size: 15px;
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+  }
+
+  /* ---------- Alerts ticker, very bottom ---------- */
+  #alerts-ticker {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    width: 1280px;
+    height: 28px;
+    background: #050811;
+    border-top: 1px solid var(--panel-border);
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+  }
+
+  #alerts-ticker .ticker-tag {
+    background: var(--cyan);
+    color: #0a0e1a;
+    font-weight: 700;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    padding: 4px 10px;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+
+  #alerts-ticker .ticker-track {
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+    height: 100%;
+  }
+
+  #alerts-ticker .ticker-content {
+    position: absolute;
+    top: 0;
+    left: 0;
+    white-space: nowrap;
+    font-size: 12px;
+    color: var(--text);
+    padding-top: 6px;
+    will-change: transform;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="marker-canvas" width="1280" height="720"></canvas>
+
+  <div id="live-badge">
+    <span class="dot"></span>
+    <span>Live</span>
+    <span class="viewers" id="viewer-count">0 watching</span>
+  </div>
+
+  <div id="tracking-panel">
+    <div class="label">Tracking now</div>
+    <div class="callsign" id="tp-callsign">—</div>
+    <div class="type" id="tp-type">—</div>
+    <div class="row"><span>Route</span><span id="tp-route">—</span></div>
+    <div class="row"><span>Altitude</span><span id="tp-alt">—</span></div>
+    <div class="row"><span>Speed</span><span id="tp-speed">—</span></div>
+    <div class="row"><span>Squawk</span><span id="tp-squawk">—</span></div>
+    <div class="emergency-flag" id="tp-emergency" style="display:none;">Emergency in progress</div>
+  </div>
+
+  <div id="stat-chips">
+    <div class="chip">
+      <div class="chip-label">Airborne</div>
+      <div class="chip-value" id="chip-airborne">—</div>
+    </div>
+    <div class="chip">
+      <div class="chip-label">Busiest</div>
+      <div class="chip-value" id="chip-busiest">—</div>
+    </div>
+  </div>
+
+  <div id="narrating" class="idle">
+    <span class="bars"><i></i><i></i><i></i></span>
+    <span id="narrating-label">Narrating</span>
+  </div>
+
+  <div id="caption-strip">
+    <div class="flight-desk">Flight desk</div>
+    <div class="caption-text" id="caption-text">Standing by for live traffic.</div>
+  </div>
+
+  <div id="alerts-ticker">
+    <div class="ticker-tag">Alerts</div>
+    <div class="ticker-track">
+      <div class="ticker-content" id="ticker-content">No active alerts.</div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/topojson/3.0.2/topojson.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  var WIDTH = 1280;
+  var HEIGHT = 720;
+  var POLL_MS = 1000;
+  var WORLD_ATLAS_URL = "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json";
+
+  // d3.geoEquirectangular projection, shared by the base map and the marker
+  // canvas so aircraft line up with country outlines exactly.
+  var projection = d3.geoEquirectangular();
+  // Canvas path generator — draws directly to ctx, no DOM element creation.
+  var canvasPath = d3.geoPath(projection);
+
+  var canvas = document.getElementById("marker-canvas");
+  var ctx = canvas.getContext("2d");
+  canvasPath.context(ctx); // wire path generator to canvas context
+
+  // ---- Base map: world-atlas countries-110m via topojson ----
+  var worldCountries = null; // cached topojson features, set once loaded
+  var graticuleGeom = null;  // cached graticule geometry (computed once)
+  var currentBounds = null; // last-applied state.camera/bounds, to avoid refitting every frame
+  var MAP_PADDING = 20;
+
+  // Draw background + land + graticule directly onto the canvas.
+  // Canvas path ops are ~10x faster than SVG DOM manipulation for this use case.
+  function drawMapCanvas() {
+    ctx.fillStyle = "#0a0e1a";
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+    if (!graticuleGeom) graticuleGeom = d3.geoGraticule().step([20, 20])();
+    ctx.beginPath();
+    canvasPath(graticuleGeom);
+    ctx.strokeStyle = "#2a3346";
+    ctx.lineWidth = 0.5;
+    ctx.globalAlpha = 0.5;
+    ctx.stroke();
+    ctx.globalAlpha = 1.0;
+
+    if (worldCountries) {
+      ctx.beginPath();
+      worldCountries.features.forEach(function(f) { canvasPath(f); });
+      ctx.fillStyle = "#1b2536";
+      ctx.fill();
+    }
+  }
+
+  // Move the projection to look at (lon, lat) at the given scale. No immediate
+  // redraw — the canvas picks it up on the next drawMarkers frame.
+  function setCamera(lon, lat, scale) {
+    projection.scale(scale).translate([0, 0]);
+    var p = projection([lon, lat]);
+    projection.translate([WIDTH / 2 - p[0], HEIGHT / 2 - p[1]]);
+  }
+
+  // Fit the projection to a [west, south, east, north] bbox, with padding,
+  // then read back the resulting view as {lon, lat, scale}. Falls back to a
+  // world fit when bounds is null/absent.
+  function viewForBounds(bounds) {
+    if (bounds) {
+      var west = bounds[0], south = bounds[1], east = bounds[2], north = bounds[3];
+      // Use a MultiPoint of the bbox corners, NOT a Polygon ring: d3-geo treats
+      // a small counterclockwise polygon as "the whole sphere minus the box",
+      // so fitExtent zooms to the entire world instead of the region. MultiPoint
+      // has no winding ambiguity — the fit is just the bbox of the points.
+      var bbox = {
+        type: "MultiPoint",
+        coordinates: [
+          [west, south],
+          [east, south],
+          [east, north],
+          [west, north],
+        ],
+      };
+      projection.fitExtent(
+        [
+          [MAP_PADDING, MAP_PADDING],
+          [WIDTH - MAP_PADDING, HEIGHT - MAP_PADDING],
+        ],
+        bbox
+      );
+    } else if (worldCountries) {
+      projection.fitSize([WIDTH, HEIGHT], worldCountries);
+    } else {
+      projection.fitSize([WIDTH, HEIGHT], { type: "Sphere" });
+    }
+    var c = projection.invert([WIDTH / 2, HEIGHT / 2]);
+    var scale = projection.scale();
+    return { lon: c[0], lat: c[1], scale: scale };
+  }
+
+  // ---- Camera animation state ----
+  // currentView is what's on screen right now; targetView is where we're
+  // headed. When state.camera/bounds changes we kick off a tween from
+  // currentView to the new targetView instead of snapping.
+  var currentView = null;
+  var targetView = null;
+  var transitionStart = null; // performance.now() at transition start, or null when idle
+  var transitionFrom = null; // view we're transitioning away from
+  var CAMERA_DURATION_MS = 1600;
+  var VIEW_EPSILON = 0.01;
+
+  // Chase-cam: when a focus aircraft is present we pin it to screen-center and
+  // move the camera to its (dead-reckoned) position every frame, so the ground
+  // and surrounding traffic visibly slide past — that's what makes motion read
+  // at real speed. chaseKey is the marker we're following; chaseScale is the
+  // tight zoom level derived from the focus box the orchestrator sends.
+  var chaseKey = null;
+  var chaseScale = null;
+
+  function viewsDiffer(a, b) {
+    if (!a || !b) return true;
+    if (Math.abs(a.lon - b.lon) > VIEW_EPSILON) return true;
+    if (Math.abs(a.lat - b.lat) > VIEW_EPSILON) return true;
+    var ratio = a.scale / b.scale;
+    if (Math.abs(ratio - 1) > VIEW_EPSILON) return true;
+    return false;
+  }
+
+  function lerp(a, b, t) {
+    return a + (b - a) * t;
+  }
+
+  function clamp01(t) {
+    return t < 0 ? 0 : t > 1 ? 1 : t;
+  }
+
+  // Re-fit only when state.camera/bounds actually changes (avoid refitting
+  // every poll tick) — but when it does change, animate to the new view
+  // rather than snapping.
+  function boundsEqual(a, b) {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    return a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3];
+  }
+
+  function applyBounds(bounds) {
+    var normalized = bounds || null;
+    if (boundsEqual(normalized, currentBounds)) return;
+    currentBounds = normalized;
+    var next = viewForBounds(normalized);
+    // Re-fit mutated projection.scale/translate as a side effect of
+    // viewForBounds; restore the currently-displayed camera so the visible
+    // frame doesn't jump before the animation loop takes over.
+    if (currentView) {
+      setCamera(currentView.lon, currentView.lat, currentView.scale);
+    }
+    if (!targetView || viewsDiffer(next, targetView)) {
+      transitionFrom = currentView || next;
+      targetView = next;
+      transitionStart = performance.now();
+    }
+  }
+
+  function initView(bounds) {
+    var view = viewForBounds(bounds);
+    currentView = view;
+    targetView = view;
+    transitionFrom = null;
+    transitionStart = null;
+    setCamera(view.lon, view.lat, view.scale);
+  }
+
+  function loadWorld() {
+    d3.json(WORLD_ATLAS_URL)
+      .then(function (world) {
+        worldCountries = topojson.feature(world, world.objects.countries);
+        // Re-init at the current camera now that real coastlines are
+        // available, so the first draw isn't at a placeholder world fit.
+        initView(currentBounds);
+      })
+      .catch(function (err) {
+        // No network / CDN unreachable: fall back to a plain background and
+        // a default projection so markers still plot at sane positions.
+        console.error("Failed to load world atlas:", err);
+        worldCountries = null;
+        initView(currentBounds);
+      });
+  }
+
+  // First paint, before the world atlas has loaded: snap (no animation).
+  initView(null);
+  loadWorld();
+
+  // ---- Live state polling + smooth marker interpolation ----
+  // Dead-reckoning marker model: each plane keeps moving along its heading at
+  // its ground speed between data updates (like FR24/tar1090), so motion stays
+  // fluid even though the feed only refreshes every ~15-30s. When a fresh fix
+  // arrives we snap the extrapolation origin to the true position and smoothly
+  // correct from wherever we were drawing it.
+  //   base{Lat,Lon}/baseTime: last TRUE fix + when we received it
+  //   track/gs: heading (deg) and ground speed (kt) used to extrapolate
+  //   correctFrom{Lat,Lon}/correctStart: short blend after a fix to avoid snaps
+  var trackedMarkers = {};
+  var latestState = null;
+  var tickerOffset = 0;
+
+  var CORRECT_MS = 800;       // blend window after a fresh fix
+  var MAX_EXTRAP_S = 120;     // cap dead-reckoning if updates stall (e.g. 429)
+
+  function keyFor(ac, idx) {
+    return ac.id || ac.callsign || ac.hex || ("idx" + idx);
+  }
+
+  // Project a true fix forward along its track at ground speed for dtSec.
+  function deadReckon(lat, lon, track, gs, dtSec) {
+    if (!gs || gs <= 0 || dtSec <= 0) return { lat: lat, lon: lon };
+    var t = Math.min(dtSec, MAX_EXTRAP_S);
+    var distDeg = (gs * (t / 3600)) / 60; // nm -> degrees of latitude
+    var rad = ((track || 0) * Math.PI) / 180;
+    var dLat = distDeg * Math.cos(rad);
+    var dLon = (distDeg * Math.sin(rad)) /
+      Math.max(Math.cos((lat * Math.PI) / 180), 0.01);
+    return { lat: lat + dLat, lon: lon + dLon };
+  }
+
+  // Where a marker should be drawn right now (extrapolated, with post-fix blend).
+  function markerPos(m, now) {
+    var ext = deadReckon(m.baseLat, m.baseLon, m.track, m.gs,
+      (now - m.baseTime) / 1000);
+    var c = Math.min(1, (now - m.correctStart) / CORRECT_MS);
+    if (c < 1) {
+      var e = easeInOutQuad(c);
+      return {
+        lat: m.correctFromLat + (ext.lat - m.correctFromLat) * e,
+        lon: m.correctFromLon + (ext.lon - m.correctFromLon) * e,
+      };
+    }
+    return ext;
+  }
+
+  function project(lat, lon) {
+    var p = projection([lon, lat]);
+    return p || [WIDTH / 2, HEIGHT / 2];
+  }
+
+  function fetchState() {
+    fetch("./state.json", { cache: "no-store" })
+      .then(function (resp) {
+        if (!resp.ok) throw new Error("state.json HTTP " + resp.status);
+        return resp.json();
+      })
+      .then(applyState)
+      .catch(function (err) {
+        // Fail gracefully: keep showing the last good state, just log it.
+        console.warn("state.json unavailable:", err.message);
+      });
+  }
+
+  function applyState(state) {
+    latestState = state;
+    var now = performance.now();
+    var aircraft = state.aircraft || [];
+    var seen = {};
+
+    aircraft.forEach(function (ac, idx) {
+      if (typeof ac.lat !== "number" || typeof ac.lon !== "number") return;
+      var k = keyFor(ac, idx);
+      seen[k] = true;
+      var existing = trackedMarkers[k];
+      if (existing) {
+        // Only treat it as a NEW fix when the true position actually moved.
+        // state.json is rewritten every narration line, but positions only
+        // change on a real data poll — resetting the base every write would
+        // freeze extrapolation, so we guard on a coordinate change.
+        if (ac.lat !== existing.baseLat || ac.lon !== existing.baseLon) {
+          var cur = markerPos(existing, now);
+          existing.correctFromLat = cur.lat;
+          existing.correctFromLon = cur.lon;
+          existing.correctStart = now;
+          existing.baseLat = ac.lat;
+          existing.baseLon = ac.lon;
+          existing.baseTime = now;
+        }
+        existing.emergency = !!ac.emergency;
+        existing.focus = !!ac.focus;
+        existing.track = ac.track;
+        existing.gs = ac.gs;
+      } else {
+        trackedMarkers[k] = {
+          baseLat: ac.lat,
+          baseLon: ac.lon,
+          baseTime: now,
+          correctFromLat: ac.lat,
+          correctFromLon: ac.lon,
+          correctStart: now,
+          emergency: !!ac.emergency,
+          focus: !!ac.focus,
+          track: ac.track,
+          gs: ac.gs,
+        };
+      }
+    });
+
+    // Drop markers that vanished from the feed.
+    Object.keys(trackedMarkers).forEach(function (k) {
+      if (!seen[k]) delete trackedMarkers[k];
+    });
+
+    // ---- Camera: chase the focus aircraft, else use the overview bounds ----
+    var focusKey = null;
+    Object.keys(trackedMarkers).forEach(function (k) {
+      if (trackedMarkers[k].focus) focusKey = k;
+    });
+
+    if (focusKey) {
+      // Derive the tight zoom from the focus box, then restore the live camera
+      // (viewForBounds mutates the projection as a side effect of fitExtent).
+      chaseScale = viewForBounds(state.camera || state.bounds).scale;
+      if (currentView) {
+        setCamera(currentView.lon, currentView.lat, currentView.scale);
+      }
+      if (focusKey !== chaseKey) {
+        // New subject: ease a zoom-in to where it is right now, then the
+        // per-frame chase below keeps it centered.
+        var fp = markerPos(trackedMarkers[focusKey], now);
+        transitionFrom = currentView || { lon: fp.lon, lat: fp.lat, scale: chaseScale };
+        targetView = { lon: fp.lon, lat: fp.lat, scale: chaseScale };
+        transitionStart = now;
+        chaseKey = focusKey;
+      }
+      currentBounds = state.camera || state.bounds || null;
+    } else {
+      chaseKey = null;
+      chaseScale = null;
+      applyBounds(state.camera || state.bounds || null);
+    }
+
+    updateChrome(state);
+  }
+
+  function updateChrome(state) {
+    // LIVE badge / viewer count.
+    var viewers = state.viewers || 0;
+    document.getElementById("viewer-count").textContent =
+      viewers.toLocaleString() + " watching";
+
+    // Stat chips.
+    document.getElementById("chip-airborne").textContent =
+      state.airborne != null ? state.airborne.toLocaleString() : "—";
+    document.getElementById("chip-busiest").textContent = state.busiest || "—";
+
+    // Caption / flight desk strip.
+    document.getElementById("caption-text").textContent =
+      state.caption || "Standing by for live traffic.";
+
+    // Narrating indicator: active whenever there's a caption to read.
+    var narratingEl = document.getElementById("narrating");
+    if (state.caption) {
+      narratingEl.classList.remove("idle");
+      document.getElementById("narrating-label").textContent = "Narrating";
+    } else {
+      narratingEl.classList.add("idle");
+      document.getElementById("narrating-label").textContent = "Standing by";
+    }
+
+    // Tracking-now panel.
+    var panel = document.getElementById("tracking-panel");
+    var t = state.tracking;
+    if (t && t.callsign) {
+      panel.classList.add("visible");
+      document.getElementById("tp-callsign").textContent = t.callsign;
+      document.getElementById("tp-type").textContent = t.type || "Unknown type";
+      document.getElementById("tp-route").textContent = t.route || "—";
+      document.getElementById("tp-alt").textContent =
+        t.alt != null ? t.alt.toLocaleString() + " ft" : "—";
+      document.getElementById("tp-speed").textContent =
+        t.speed != null ? t.speed + " kt" : "—";
+      document.getElementById("tp-squawk").textContent = t.squawk || "—";
+      document.getElementById("tp-emergency").style.display = t.emergency ? "block" : "none";
+    } else {
+      panel.classList.remove("visible");
+    }
+
+    // Alerts ticker.
+    var alerts = state.alerts || [];
+    var text = alerts.length ? alerts.join("     ·     ") : "No active alerts.";
+    document.getElementById("ticker-content").textContent = text + "          " + text;
+  }
+
+  fetchState();
+  setInterval(fetchState, POLL_MS);
+
+  // ---- Canvas marker rendering loop (dead-reckoning, independent of poll) ----
+  var PLANE_LENGTH = 11; // nose-to-tail size in px, ~10-12px as specified
+
+  function easeInOutQuad(t) {
+    return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+  }
+
+  // Draw a small triangular plane silhouette pointing "up" (north) before
+  // rotation, in local coordinates centered on (0, 0). The canvas is rotated
+  // to the aircraft's track heading before this is called.
+  function drawPlaneGlyph(size) {
+    var noseY = -size * 0.6;
+    var tailY = size * 0.5;
+    var wingY = size * 0.05;
+    var wingX = size * 0.42;
+    var tailWingX = size * 0.18;
+
+    ctx.beginPath();
+    ctx.moveTo(0, noseY); // nose
+    ctx.lineTo(wingX, wingY); // right wingtip
+    ctx.lineTo(size * 0.12, size * 0.12); // right wing root
+    ctx.lineTo(tailWingX, tailY); // right tail
+    ctx.lineTo(0, size * 0.32); // tail center notch
+    ctx.lineTo(-tailWingX, tailY); // left tail
+    ctx.lineTo(-size * 0.12, size * 0.12); // left wing root
+    ctx.lineTo(-wingX, wingY); // left wingtip
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  var FOCUS_RADIUS = 5;
+  var NORMAL_MARKER_RADIUS = 3;
+  var FOCUS_COLOR_EMERGENCY = "#e0584a";
+  var FOCUS_COLOR_NORMAL = "#3ddc84";
+  var MUTED_COLOR = "#5a6678";
+
+  // Advance the camera tween (if one is in flight) by setting the
+  // projection's scale/translate for this frame. Markers are reprojected
+  // from live lat/lon every frame, so they track the moving camera.
+  function updateCamera() {
+    if (!transitionStart) return;
+    var now = performance.now();
+    var t = clamp01((now - transitionStart) / CAMERA_DURATION_MS);
+    var e = easeInOutQuad(t);
+    var start = transitionFrom;
+    var target = targetView;
+
+    var lon = lerp(start.lon, target.lon, e);
+    var lat = lerp(start.lat, target.lat, e);
+    var centerDist = Math.hypot(target.lon - start.lon, target.lat - start.lat);
+    var dipAmount = Math.min(centerDist / 12, 1);
+    var dip = 1 - 0.6 * dipAmount * Math.sin(Math.PI * t);
+    var scale = lerp(start.scale, target.scale, e) * dip;
+
+    setCamera(lon, lat, scale);
+    currentView = { lon: lon, lat: lat, scale: scale };
+
+    if (t >= 1) {
+      currentView = targetView;
+      transitionStart = null;
+      transitionFrom = null;
+    }
+  }
+
+  // Cap animation to screenshot rate — 500 aircraft at 60fps exhausts Chromium CPU.
+  // setInterval instead of requestAnimationFrame: headless Chrome fires rAF at
+  // 60fps continuously even when we skip work, pushing Chromium's compositor
+  // harder than needed. setInterval at 250ms (~4fps) matches screenshot rate.
+  var _DRAW_INTERVAL_MS = 250; // 4fps to match STREAM_FPS default
+  function drawMarkers() {
+    var now = performance.now();
+
+    updateCamera();
+
+    // Chase-cam: once the zoom-in transition is done, keep the focus aircraft
+    // pinned to center by moving the camera to its live position each frame.
+    // The plane stays put on screen; the map and other traffic slide past.
+    if (chaseKey && chaseScale && !transitionStart) {
+      var fm = trackedMarkers[chaseKey];
+      if (fm) {
+        var fp = markerPos(fm, now);
+        setCamera(fp.lon, fp.lat, chaseScale);
+        currentView = { lon: fp.lon, lat: fp.lat, scale: chaseScale };
+      } else {
+        chaseKey = null; // lost the subject (left the feed)
+      }
+    }
+
+    drawMapCanvas(); // replaces clearRect — draws bg + land + graticule to canvas
+
+    Object.keys(trackedMarkers).forEach(function (k) {
+      var m = trackedMarkers[k];
+      var pos = markerPos(m, now);
+      var xy = project(pos.lat, pos.lon);
+      var x = xy[0];
+      var y = xy[1];
+
+      var color, ringRadius, size;
+      if (m.focus) {
+        color = m.emergency ? FOCUS_COLOR_EMERGENCY : FOCUS_COLOR_NORMAL;
+        ringRadius = FOCUS_RADIUS;
+        size = PLANE_LENGTH * 1.4;
+      } else {
+        color = MUTED_COLOR;
+        ringRadius = NORMAL_MARKER_RADIUS;
+        size = PLANE_LENGTH;
+      }
+
+      // Pulse ring for the focus aircraft when it's an emergency.
+      if (m.focus && m.emergency) {
+        var pulsePhase = (now / 900) % 1;
+        var pulseRadius = ringRadius + pulsePhase * 14;
+        var pulseAlpha = 0.55 * (1 - pulsePhase);
+        ctx.beginPath();
+        ctx.arc(x, y, pulseRadius, 0, Math.PI * 2);
+        ctx.strokeStyle = "rgba(224, 88, 74, " + pulseAlpha.toFixed(3) + ")";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+
+      // Focus aircraft (non-emergency) get a steady highlight ring.
+      if (m.focus && !m.emergency) {
+        ctx.beginPath();
+        ctx.arc(x, y, ringRadius + 5, 0, Math.PI * 2);
+        ctx.strokeStyle = "rgba(61, 220, 132, 0.6)";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+
+      // Plane glyph, rotated to the aircraft's track heading (0 = north/up,
+      // clockwise positive — matches canvas rotation convention directly).
+      var headingRad = ((m.track || 0) * Math.PI) / 180;
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(headingRad);
+      ctx.fillStyle = color;
+      drawPlaneGlyph(size);
+      ctx.restore();
+    });
+
+  }
+
+  setInterval(drawMarkers, _DRAW_INTERVAL_MS);
+})();
+</script>
+</body>
+</html>

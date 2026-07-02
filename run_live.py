@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Contrail — live orchestrator (Phases 2-5).
+
+Ties the pipeline together:
+    ingest -> enrich -> detect -> director -> narrate -> state.json -> renderer -> stream
+
+Modes:
+    python run_live.py                 full local: speaks each line, writes state.json
+    python run_live.py --silent        director only (no TTS); needs only ANTHROPIC_API_KEY
+    python run_live.py --once          a single cycle then exit
+    python run_live.py --stream-test   render+narrate to a local MP4 (validate before live)
+    python run_live.py --stream        go live to YouTube (needs YOUTUBE_STREAM_KEY)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import os
+import random
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from contrail.config import Config
+from contrail.data.regions import REGIONS
+from contrail.detect import EventDetector
+from contrail.director import Director, ScriptLine
+from contrail.enrich import enrich_all
+from contrail.ingest import AdsbClient
+from contrail.models import Aircraft
+from contrail.narrate import Narrator, estimate_speech_seconds, play
+
+EMERGENCY_SQUAWKS = ("7700", "7600")
+STATE_PATH = Path(__file__).parent / "contrail" / "renderer" / "state.json"
+MAX_PLOTTED = 200
+
+# Globe "travel beat": when rotating regions we pull all the way out to the world
+# before zooming into the next region. Equirectangular-friendly world extent.
+WORLD_BOUNDS = [-170.0, -58.0, 178.0, 74.0]
+
+# How long to dwell on a region before rotating. Jittered so it's not clockwork;
+# REGION_ROTATE_SECONDS env forces a fixed value (handy for testing).
+ROTATE_MIN_S = 600
+ROTATE_MAX_S = 900
+
+_TRAVEL_LINES = [
+    "That's the picture over {old} for now. Let's pull back and cross to {new}.",
+    "We'll leave {old} there, and travel across to {new}.",
+    "Time to move on from {old} — taking the long way around to {new}.",
+    "Pulling out to the wider world now, and setting our sights on {new}.",
+    "We've spent a while over {old}. Let's swing the camera around to {new}.",
+]
+
+
+def _next_rotation_delay() -> float:
+    override = os.getenv("REGION_ROTATE_SECONDS")
+    if override:
+        try:
+            return float(override)
+        except ValueError:
+            pass
+    return random.uniform(ROTATE_MIN_S, ROTATE_MAX_S)
+
+log = logging.getLogger("contrail.live")
+
+
+def _dedupe(aircraft: list[Aircraft]) -> list[Aircraft]:
+    seen: dict[str, Aircraft] = {}
+    for ac in aircraft:
+        if ac.hex and ac.hex not in seen:
+            seen[ac.hex] = ac
+    return list(seen.values())
+
+
+def _fetch(client: AdsbClient, region: tuple) -> tuple[list[Aircraft], int]:
+    """Region traffic plus GLOBAL emergencies (7700/7600 are not region-limited,
+    so a developing incident anywhere on earth can still break into the show)."""
+    emergencies: list[Aircraft] = []
+    for code in EMERGENCY_SQUAWKS:
+        emergencies += client.get_squawk(code)
+    region_ac = client.get_region(*region)
+    aircraft = enrich_all(_dedupe(emergencies + region_ac))
+    return aircraft, len(region_ac)
+
+
+def _speak(line, narrator, streamer) -> None:
+    """Play/queue a line's audio (or just pace the loop when silent)."""
+    if line and narrator:
+        try:
+            path = narrator.synth(line.text)
+            if streamer:
+                streamer.enqueue_audio(path)
+                time.sleep(estimate_speech_seconds(line.text))
+            else:
+                play(path)  # blocking; paces the loop
+        except Exception as exc:
+            log.warning("TTS failed: %s", exc)
+            time.sleep(estimate_speech_seconds(line.text))
+    else:
+        time.sleep(estimate_speech_seconds(line.text) if line else 5)
+
+
+def _region_bounds(region) -> list[float]:
+    """[west, south, east, north] for the coverage circle, so the renderer can
+    zoom the map to where the traffic actually is instead of showing the world."""
+    lat, lon, r_nm = region
+    dlat = r_nm / 60.0
+    dlon = r_nm / (60.0 * max(math.cos(math.radians(lat)), 0.1))
+    return [lon - dlon, lat - dlat, lon + dlon, lat + dlat]
+
+
+# Radius (nm) of the zoomed-in box around the narrated flight. Our basemap
+# (coarse country outlines) has no ground detail at city zoom, so we stay at a
+# regional zoom where coastlines are visible — the chase-cam then slides those
+# outlines past the centered subject for a gentle motion cue. (Tighter, adsb.lol
+# -style motion would need a detailed tile basemap; deferred.)
+FOCUS_RADIUS_NM_EVENT = 40.0    # emergencies: closer
+FOCUS_RADIUS_NM_AMBIENT = 70.0  # ordinary subjects: more context
+
+
+def _write_state(aircraft, line, candidates, region_count, bounds=None) -> None:
+    focus_hex = line.aircraft.hex if (line and line.aircraft) else None
+
+    # Keep the focus aircraft from being dropped by the MAX_PLOTTED cap.
+    positioned = [a for a in aircraft if a.lat is not None and a.lon is not None]
+    positioned.sort(key=lambda a: 0 if a.hex == focus_hex else 1)
+    plotted = [
+        {
+            "id": a.hex, "lat": a.lat, "lon": a.lon, "track": a.track or 0,
+            "gs": round(a.ground_speed) if a.ground_speed else 0,
+            "emergency": (a.emergency or "none").lower() != "none"
+            or a.squawk in EMERGENCY_SQUAWKS,
+            "focus": a.hex == focus_hex,
+        }
+        for a in positioned
+    ][:MAX_PLOTTED]
+
+    tracking = None
+    if line and line.aircraft and line.aircraft.lat is not None:
+        ac = line.aircraft
+        tracking = {
+            "callsign": ac.callsign or ac.hex,
+            "type": ac.type_desc or ac.type_code or "",
+            "route": None,
+            "alt": ac.altitude,
+            "speed": round(ac.ground_speed) if ac.ground_speed else None,
+            "squawk": ac.squawk,
+            "emergency": line.segment == "event",
+            "lat": ac.lat, "lon": ac.lon,
+        }
+
+    alerts = [c.headline for c in candidates
+              if not (c.aircraft and c.aircraft.hex == focus_hex)][:6]
+
+    # Camera: follow whatever aircraft we're narrating so its green/red highlight
+    # is actually visible. Emergencies zoom in tighter; ordinary subjects get a
+    # slightly wider box. With no aircraft subject we keep the calm region view.
+    camera = bounds
+    if line and line.aircraft and line.aircraft.lat is not None:
+        flat, flon = line.aircraft.lat, line.aircraft.lon
+        radius_nm = (FOCUS_RADIUS_NM_EVENT if line.segment == "event"
+                     else FOCUS_RADIUS_NM_AMBIENT)
+        span = radius_nm / 60.0
+        dlon = span / max(math.cos(math.radians(flat)), 0.1)
+        camera = [flon - dlon, flat - span, flon + dlon, flat + span]
+
+    state = {
+        "generated": time.time(),
+        "viewers": 0,
+        "airborne": region_count,
+        "busiest": "",
+        "segment": line.segment if line else "ambient",
+        "caption": line.text if line else "",
+        "tracking": tracking,
+        "alerts": alerts,
+        "bounds": bounds,            # [west, south, east, north] full region
+        "camera": camera,            # current view box (tightens on notable flights)
+        "aircraft": plotted,
+    }
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state))
+
+    # Per-cycle focus diagnostics (appended, so every cycle is captured).
+    n_focus = sum(1 for a in plotted if a["focus"])
+    log.info(
+        "cycle: seg=%s focus_hex=%r in_plotted=%s n_focus=%d caption=%.60s",
+        state["segment"], focus_hex,
+        any(a["id"] == focus_hex for a in plotted) if focus_hex else False,
+        n_focus, state["caption"],
+    )
+
+
+def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
+                   streamer=None, once: bool = False) -> None:
+    """The brains: poll -> detect -> direct -> narrate -> state.json.
+
+    Local mode plays audio inline (paces the loop). Stream mode hands audio to
+    the streamer and lets speech duration pace the loop.
+    """
+    client = AdsbClient(cfg.adsb_source)
+    detector = EventDetector()
+    director = Director()
+    narrator = None if silent else Narrator()
+
+    # Region rotation state.
+    region_idx = 0
+    region = REGIONS[region_idx]
+    cur_region = region.tuple
+    region_started = time.time()
+    rotate_after = _next_rotation_delay()
+
+    bounds = _region_bounds(cur_region)
+    aircraft, region_count = _fetch(client, cur_region)
+    last_poll = time.time()
+
+    while not stop.is_set():
+        now = time.time()
+
+        # Rotate to the next region on a timer — but never while an emergency is
+        # being tracked, so we don't abandon a developing incident mid-story.
+        if (not once and not director._incident.active
+                and now - region_started >= rotate_after):
+            old_name = region.name
+            region_idx = (region_idx + 1) % len(REGIONS)
+            region = REGIONS[region_idx]
+            cur_region = region.tuple
+
+            # Globe beat: one line on the world map while we "travel" there. The
+            # renderer eases the camera out to WORLD_BOUNDS, then into the next
+            # region on the following cycle.
+            travel = ScriptLine(
+                text=random.choice(_TRAVEL_LINES).format(old=old_name, new=region.name),
+                segment="travel", priority=0)
+            _write_state(aircraft, travel, [], region_count, WORLD_BOUNDS)
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            print(f"[{ts}Z] (travel) {travel.text}")
+            _speak(travel, narrator, streamer)
+
+            # Arrive: refetch the new region and resume.
+            bounds = _region_bounds(cur_region)
+            new_ac, new_rc = _fetch(client, cur_region)
+            if new_ac:
+                aircraft, region_count = new_ac, new_rc
+            last_poll = time.time()
+            region_started = time.time()
+            rotate_after = _next_rotation_delay()
+            continue
+
+        if now - last_poll >= cfg.poll_interval:
+            new_ac, new_rc = _fetch(client, cur_region)
+            last_poll = now
+            if new_ac:  # keep the last good snapshot if a fetch fails (e.g. 429)
+                aircraft, region_count = new_ac, new_rc
+
+        ctx = {"region_count": region_count, "region_name": region.name}
+        candidates = detector.detect(aircraft, ctx)
+        line = director.next_line(candidates, ctx, aircraft)
+        _write_state(aircraft, line, candidates, region_count, bounds)
+
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        if line:
+            tag = "EVENT" if line.segment == "event" else line.segment
+            print(f"[{ts}Z] ({tag}) {line.text}")
+        else:
+            print(f"[{ts}Z] (nothing to say this cycle)")
+
+        if once:
+            return
+
+        _speak(line, narrator, streamer)
+
+
+def _run_session(cfg: Config, *, target: str, max_session_s=None,
+                 test_duration_s: float = 45.0) -> float:
+    """One streamer session: pipeline thread + streamer on the main thread.
+    Returns how many seconds it ran. Lets KeyboardInterrupt propagate."""
+    from contrail.stream import LiveStreamer
+    streamer = LiveStreamer(target=target, test_duration_s=test_duration_s,
+                            max_session_s=max_session_s)
+    stop = threading.Event()
+    worker = threading.Thread(
+        target=_pipeline_loop, args=(stop, cfg),
+        kwargs={"silent": False, "streamer": streamer}, daemon=True,
+    )
+    worker.start()
+    started = time.time()
+    try:
+        streamer.run()  # blocks until max_session_s/test duration, crash, or ^C
+    finally:
+        stop.set()
+        streamer.stop()
+        worker.join(timeout=3)
+    return time.time() - started
+
+
+def _run_live_supervised(cfg: Config) -> None:
+    """24/7 live: restart the session on crash or on a scheduled interval (to
+    recycle Chromium/ffmpeg before they leak), with backoff on rapid failures."""
+    restart_s = float(os.getenv("STREAM_RESTART_SECONDS") or "21600")  # 6h default
+    backoff = 5.0
+    while True:
+        try:
+            ran = _run_session(cfg, target="rtmp", max_session_s=restart_s)
+        except KeyboardInterrupt:
+            print("\nstopped.")
+            return
+        except Exception as exc:  # crash: log and restart
+            log.error("stream session crashed: %s", exc)
+            ran = 0.0
+        if ran < 30:  # crashed fast — back off so we don't hammer
+            backoff = min(backoff * 2, 120)
+            print(f"session ended after {ran:.0f}s; restarting in {backoff:.0f}s")
+            time.sleep(backoff)
+        else:        # healthy run or scheduled recycle — restart promptly
+            backoff = 5.0
+            print(f"session ran {ran:.0f}s; recycling and restarting")
+            time.sleep(2)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Contrail live orchestrator")
+    p.add_argument("--once", action="store_true", help="single cycle then exit")
+    p.add_argument("--silent", action="store_true",
+                   help="director only, no TTS (needs only ANTHROPIC_API_KEY)")
+    p.add_argument("--stream", action="store_true", help="go live to YouTube RTMP")
+    p.add_argument("--stream-test", action="store_true",
+                   help="render+narrate to a local MP4 instead of RTMP")
+    args = p.parse_args()
+
+    cfg = Config.load()
+    logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO),
+                        format="%(levelname)s %(name)s: %(message)s")
+
+    streaming = args.stream or args.stream_test
+    print(f"Contrail live — source={cfg.adsb_source} "
+          f"mode={'stream' if streaming else ('silent' if args.silent else 'local')}")
+
+    if not streaming:
+        stop = threading.Event()
+        try:
+            _pipeline_loop(stop, cfg, silent=args.silent, once=args.once)
+        except KeyboardInterrupt:
+            print("\nstopped.")
+        return
+
+    if args.stream:
+        # 24/7 live: supervised, auto-restarting.
+        _run_live_supervised(cfg)
+        return
+
+    # --stream-test: one-shot local MP4 for validation.
+    try:
+        _run_session(cfg, target="test", test_duration_s=45.0)
+    except KeyboardInterrupt:
+        print("\nstopping…")
+
+
+if __name__ == "__main__":
+    main()
