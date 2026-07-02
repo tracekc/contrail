@@ -139,15 +139,56 @@ class LiveStreamer:
         return cmd
 
     # ── frame producer ────────────────────────────────────────
+    def _session_end(self):
+        """Wall-clock deadline for this session, or None to run until stopped."""
+        if self.target == "test":
+            return time.monotonic() + self.test_duration_s
+        if self.max_session_s:
+            return time.monotonic() + self.max_session_s
+        return None
+
     def _frame_loop(self) -> None:
+        """Dispatch to the browser or native frame source.
+
+        RENDERER=native draws frames directly with Skia (no Chromium, no
+        screenshot IPC); anything else (default) uses the Playwright path.
+        """
+        if os.getenv("RENDERER", "browser").strip().lower() == "native":
+            self._frame_loop_native()
+        else:
+            self._frame_loop_browser()
+
+    def _frame_loop_native(self) -> None:
+        from .renderer.native import NativeRenderer
+        from .renderer.render import STATE_JSON
+
         interval = 1.0 / self.fps
         deadline = time.monotonic()
-        if self.target == "test":
-            end = time.monotonic() + self.test_duration_s
-        elif self.max_session_s:
-            end = time.monotonic() + self.max_session_s
-        else:
-            end = None
+        end = self._session_end()
+        renderer = NativeRenderer()
+        try:
+            while not self._stop.is_set():
+                if end and time.monotonic() >= end:
+                    break
+                renderer.poll_state(STATE_JSON)
+                jpeg = renderer.render_frame(quality=75)
+                try:
+                    self._proc.stdin.write(jpeg)
+                except (BrokenPipeError, ValueError):
+                    break
+                deadline += interval
+                sleep = deadline - time.monotonic()
+                if sleep > 0:
+                    time.sleep(sleep)
+        finally:
+            if self._proc and self._proc.stdin:
+                with contextlib.suppress(Exception):
+                    self._proc.stdin.close()
+
+    def _frame_loop_browser(self) -> None:
+        interval = 1.0 / self.fps
+        deadline = time.monotonic()
+        end = self._session_end()
         with sync_playwright() as pw:
             browser = pw.chromium.launch()
             try:

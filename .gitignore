@@ -15,6 +15,7 @@ skywatch.log
 *.log
 contrail/renderer/state.json
 contrail/renderer/test_frame.png
+contrail/renderer/native_frame.png
 
 # Generated media / test output
 *.mp4
