@@ -38,6 +38,11 @@ MAX_EXTRAP_S = 120.0
 PLANE_LENGTH = 11
 FOCUS_RADIUS = 5
 NORMAL_MARKER_RADIUS = 3
+# Extra map rendered around the viewport so that chase-cam pans (constant scale,
+# translation only) can be served by blitting the cached base at an offset,
+# instead of re-projecting the whole world every frame. Rebuild only when the
+# pan runs past this margin or the zoom (scale) changes.
+BASE_MARGIN = 512
 
 
 def _c(hex_str: str, a: int = 255) -> int:
@@ -188,6 +193,15 @@ class NativeRenderer:
         self.world = _load_world()
         self.proj = _Projection()
         self.surface = skia.Surface(WIDTH, HEIGHT)
+
+        # Cached base map (bg + graticule + land). Rendered into an oversized
+        # surface (viewport + BASE_MARGIN on every side) so a chase-cam pan is a
+        # cheap blit-at-offset rather than a full world re-projection each frame.
+        self._base_surface = skia.Surface(WIDTH + 2 * BASE_MARGIN, HEIGHT + 2 * BASE_MARGIN)
+        self._base_cache: Optional[skia.Image] = None
+        self._cache_scale: Optional[float] = None
+        self._cache_tx: Optional[float] = None
+        self._cache_ty: Optional[float] = None
 
         # marker + camera state (mirrors scene.html closures)
         self.tracked: dict[str, dict] = {}
@@ -367,8 +381,47 @@ class NativeRenderer:
             self._apply_bounds(cam, now)
 
     # ── drawing ──────────────────────────────────────────────────────
-    def _draw_base_map(self, c: skia.Canvas) -> None:
+    def _draw_base(self, c: skia.Canvas) -> None:
+        """Paint the base map onto the frame canvas, using the cached oversized
+        base when the zoom is stable (overview + chase-cam) and only re-rendering
+        the world during a scale-changing camera transition."""
+        scale, tx, ty = self.proj.scale, self.proj.tx, self.proj.ty
+
+        # Mid-transition the zoom changes every frame, so a pan-blit can't stand
+        # in — draw the base directly at viewport size (same cost as before) and
+        # drop the stale cache. Transitions are brief (~1.6s).
+        if self.transition_start is not None:
+            c.clear(BG)
+            self._paint_base(c)
+            self._base_cache = None
+            return
+
+        # Stable zoom: (re)build the oversized cache only when missing, the scale
+        # changed, or a pan ran past the margin. Otherwise reuse it.
+        if (self._base_cache is None or scale != self._cache_scale
+                or abs(tx - self._cache_tx) > BASE_MARGIN
+                or abs(ty - self._cache_ty) > BASE_MARGIN):
+            self._render_base_cache(scale, tx, ty)
+
+        dtx, dty = tx - self._cache_tx, ty - self._cache_ty
         c.clear(BG)
+        c.drawImage(self._base_cache, -BASE_MARGIN + dtx, -BASE_MARGIN + dty)
+
+    def _render_base_cache(self, scale: float, tx: float, ty: float) -> None:
+        """Render the full base map into the oversized surface at the current
+        projection, offset by BASE_MARGIN so viewport (0,0) maps to (M, M)."""
+        bc = self._base_surface.getCanvas()
+        bc.clear(BG)
+        bc.save()
+        bc.translate(BASE_MARGIN, BASE_MARGIN)
+        self._paint_base(bc)
+        bc.restore()
+        self._base_cache = self._base_surface.makeImageSnapshot()
+        self._cache_scale, self._cache_tx, self._cache_ty = scale, tx, ty
+
+    def _paint_base(self, c: skia.Canvas) -> None:
+        """Draw graticule + land using the current projection. No background
+        clear (callers clear first) so it composes into the oversized cache."""
         proj = self.proj.project
         grat = skia.Paint(Color=GRAT, Style=skia.Paint.kStroke_Style,
                           StrokeWidth=0.5, AntiAlias=True)
@@ -572,7 +625,7 @@ class NativeRenderer:
                 self.chase_key = None
 
         c = self.surface.getCanvas()
-        self._draw_base_map(c)
+        self._draw_base(c)
         self._draw_markers(c, now)
         self._draw_chrome(c, now)
         img = self.surface.makeImageSnapshot()
