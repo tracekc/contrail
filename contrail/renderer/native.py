@@ -568,8 +568,7 @@ class NativeRenderer:
                   + (14 if (has_reg or has_age) else 0)   # badges row
                   + (12 if t.get("photo_credit") else 0)  # photo credit
                   + 8                # section divider gap
-                  + (14 * 2 if has_route else 0)           # two airport name lines
-                  + (8 if has_route else 0)                # gap after route
+                  + (16 * 2 if has_route else 0)           # two route rows (same spacing as data rows)
                   + len(data_rows) * 16
                   + (20 if has_emergency else 0)
                   + 12)              # bottom padding
@@ -650,28 +649,28 @@ class NativeRenderer:
             # Divider gap
             iy += 8
 
-            # Airport names (route)
+            # Route rows — same label-left / value-right layout as data rows.
             if has_route:
-                # _safe converts "→" to "->"; split on that after normalization.
                 route_safe = _safe(t["route"])
                 route_parts = route_safe.split("->", 1)
+                f_route = _font(10)
+                max_val_w = pw - 24 - f_small.measureText("From") - 8
                 if len(route_parts) == 2:
-                    origin_str = route_parts[0].strip()
-                    dest_str = route_parts[1].strip()
-                    max_chars = 28
-                    if len(origin_str) > max_chars:
-                        origin_str = origin_str[:max_chars - 2] + ".."
-                    if len(dest_str) > max_chars:
-                        dest_str = dest_str[:max_chars - 2] + ".."
-                    c.drawString("FROM", ix, iy, f_label, skia.Paint(Color=TEXT_DIM, AntiAlias=True))
-                    c.drawString(origin_str, ix + 36, iy, _font(10), skia.Paint(Color=TEXT, AntiAlias=True))
-                    iy += 14
-                    c.drawString("TO", ix, iy, f_label, skia.Paint(Color=TEXT_DIM, AntiAlias=True))
-                    c.drawString(dest_str, ix + 36, iy, _font(10), skia.Paint(Color=TEXT, AntiAlias=True))
-                    iy += 8
+                    for lbl, name in [("From", route_parts[0].strip()),
+                                      ("To",   route_parts[1].strip())]:
+                        # Truncate name until it fits the right-aligned value slot.
+                        while f_route.measureText(name) > max_val_w and len(name) > 4:
+                            name = name[:-2] + ".."
+                        c.drawString(lbl, ix, iy, f_small,
+                                     skia.Paint(Color=TEXT_DIM, AntiAlias=True))
+                        nw = f_route.measureText(name)
+                        c.drawString(name, px + pw - 12 - nw, iy, f_route,
+                                     skia.Paint(Color=TEXT, AntiAlias=True))
+                        iy += 16
                 else:
-                    c.drawString(route_safe, ix, iy, f_small, skia.Paint(Color=TEXT, AntiAlias=True))
-                    iy += 14
+                    c.drawString(route_safe, ix, iy, f_small,
+                                 skia.Paint(Color=TEXT, AntiAlias=True))
+                    iy += 16
 
             # Data rows (altitude / speed / squawk)
             for label, val in data_rows:
