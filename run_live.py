@@ -39,6 +39,7 @@ from contrail.narrate import Narrator, estimate_speech_seconds, play
 EMERGENCY_SQUAWKS = ("7700", "7600")
 STATE_PATH = Path(__file__).parent / "contrail" / "renderer" / "state.json"
 MAX_PLOTTED = 200
+_STATE_LOCK = threading.Lock()
 
 # Globe "travel beat": when rotating regions we pull all the way out to the world
 # before zooming into the next region. Equirectangular-friendly world extent.
@@ -70,6 +71,32 @@ def _next_rotation_delay() -> float:
 log = logging.getLogger("contrail.live")
 
 _enrich_cache = EnrichmentCache()
+
+
+def _patch_tracking(ac_hex: str, fields: dict) -> None:
+    """Called from background enrichment threads to push data into state.json immediately.
+
+    Only applies if the currently tracked aircraft still matches ac_hex, so
+    a stale fetch from a previous aircraft never corrupts the active panel.
+    """
+    with _STATE_LOCK:
+        if not STATE_PATH.exists():
+            return
+        try:
+            state = json.loads(STATE_PATH.read_text())
+        except Exception:
+            return
+        t = state.get("tracking")
+        if not t or t.get("hex") != ac_hex:
+            return
+        t.update(fields)
+        # If a photo_url just arrived and we don't have a local path yet, download now.
+        photo_url = fields.get("photo_url")
+        if photo_url and not t.get("photo_path"):
+            ph = photo_cache.get_photo_path(ac_hex, photo_url)
+            t["photo_path"] = str(ph) if ph else None
+        STATE_PATH.write_text(json.dumps(state))
+        log.info("enrichment patch applied: hex=%s fields=%s", ac_hex, list(fields))
 
 
 def _dedupe(aircraft: list[Aircraft]) -> list[Aircraft]:
@@ -146,8 +173,31 @@ def _write_state(aircraft, line, candidates, region_count, bounds=None) -> None:
     tracking = None
     if line and line.aircraft and line.aircraft.lat is not None:
         ac = line.aircraft
-        ac_data = lookup_aircraft(ac.hex, _enrich_cache) if ac.hex else None
-        rt_data = lookup_route(ac.callsign, _enrich_cache)
+        hex_ = ac.hex or ""
+
+        # Callbacks: when a background fetch completes it calls _patch_tracking
+        # immediately, so enrichment appears on the panel without waiting for the
+        # next narration cycle.
+        def _on_aircraft(data: dict, _hex=hex_) -> None:
+            _patch_tracking(_hex, {
+                "registration": data.get("registration"),
+                "built_year": data.get("built_year"),
+                "operator": data.get("operator"),
+                "photo_url": data.get("photo_url"),
+                "photo_credit": data.get("photo_credit"),
+            })
+
+        def _on_route(data: dict, _hex=hex_) -> None:
+            o_name = data.get("origin_name") or data.get("origin_iata") or data.get("origin_icao")
+            d_name = data.get("dest_name") or data.get("dest_iata") or data.get("dest_icao")
+            _patch_tracking(_hex, {
+                "route": f"{o_name} → {d_name}" if o_name and d_name else None,
+                "origin_iata": data.get("origin_iata"),
+                "dest_iata": data.get("dest_iata"),
+            })
+
+        ac_data = lookup_aircraft(hex_, _enrich_cache, on_complete=_on_aircraft) if hex_ else None
+        rt_data = lookup_route(ac.callsign, _enrich_cache, on_complete=_on_route)
 
         # Build route display string from enriched names or fall back to IATAs.
         route_str = None
@@ -159,12 +209,13 @@ def _write_state(aircraft, line, candidates, region_count, bounds=None) -> None:
 
         photo_url = (ac_data or {}).get("photo_url")
         photo_path = None
-        if ac.hex and photo_url:
-            p = photo_cache.get_photo_path(ac.hex, photo_url)
+        if hex_ and photo_url:
+            p = photo_cache.get_photo_path(hex_, photo_url)
             photo_path = str(p) if p else None
 
         tracking = {
-            "callsign": ac.callsign or ac.hex,
+            "hex": hex_,
+            "callsign": ac.callsign or hex_,
             "type": ac.type_desc or ac.type_code or "",
             "route": route_str,
             "alt": ac.altitude,
@@ -211,7 +262,8 @@ def _write_state(aircraft, line, candidates, region_count, bounds=None) -> None:
         "aircraft": plotted,
     }
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state))
+    with _STATE_LOCK:
+        STATE_PATH.write_text(json.dumps(state))
 
     # Per-cycle focus diagnostics (appended, so every cycle is captured).
     n_focus = sum(1 for a in plotted if a["focus"])

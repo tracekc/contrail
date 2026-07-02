@@ -54,7 +54,7 @@ def enrich_all(aircraft: list[Aircraft]) -> list[Aircraft]:
 # ── External API enrichment (non-blocking, background threads) ────────────────
 
 
-def _fetch_aircraft_bg(hex_: str, cache: "EnrichmentCache") -> None:
+def _fetch_aircraft_bg(hex_: str, cache: "EnrichmentCache", on_complete=None) -> None:
     """Background: fetch aircraft details from adsbdb + photo from planespotters."""
     import requests
 
@@ -89,13 +89,22 @@ def _fetch_aircraft_bg(hex_: str, cache: "EnrichmentCache") -> None:
 
     if data:
         cache.set_aircraft(hex_, data)
+        if on_complete:
+            try:
+                on_complete(data)
+            except Exception as exc:
+                log.debug("aircraft on_complete callback failed: %s", exc)
 
     with _pending_lock:
         _pending.discard(f"ac:{hex_.lower()}")
 
 
-def lookup_aircraft(hex_: str, cache: "EnrichmentCache") -> Optional[dict]:
-    """Return cached aircraft data immediately; fire background fetch if stale."""
+def lookup_aircraft(hex_: str, cache: "EnrichmentCache", on_complete=None) -> Optional[dict]:
+    """Return cached aircraft data immediately; fire background fetch if stale.
+
+    on_complete(data) is called from the background thread when a fresh fetch
+    lands — use it to push data into the UI without waiting for the next cycle.
+    """
     cached = cache.get_aircraft(hex_)
     if cached:
         return cached
@@ -104,12 +113,12 @@ def lookup_aircraft(hex_: str, cache: "EnrichmentCache") -> Optional[dict]:
         if key not in _pending:
             _pending.add(key)
             threading.Thread(
-                target=_fetch_aircraft_bg, args=(hex_, cache), daemon=True
+                target=_fetch_aircraft_bg, args=(hex_, cache, on_complete), daemon=True
             ).start()
     return None
 
 
-def _fetch_route_bg(callsign: str, cache: "EnrichmentCache") -> None:
+def _fetch_route_bg(callsign: str, cache: "EnrichmentCache", on_complete=None) -> None:
     """Background: fetch route from adsbdb."""
     import requests
 
@@ -124,14 +133,20 @@ def _fetch_route_bg(callsign: str, cache: "EnrichmentCache") -> None:
         origin = fr.get("origin") or {}
         dest = fr.get("destination") or {}
         if origin and dest:
-            cache.set_route(callsign, {
+            data = {
                 "origin_icao": origin.get("icao_code"),
                 "origin_iata": origin.get("iata_code"),
                 "origin_name": origin.get("name"),
                 "dest_icao": dest.get("icao_code"),
                 "dest_iata": dest.get("iata_code"),
                 "dest_name": dest.get("name"),
-            })
+            }
+            cache.set_route(callsign, data)
+            if on_complete:
+                try:
+                    on_complete(data)
+                except Exception as exc:
+                    log.debug("route on_complete callback failed: %s", exc)
     except Exception as exc:
         log.debug("adsbdb route lookup failed %s: %s", callsign, exc)
     finally:
@@ -139,8 +154,12 @@ def _fetch_route_bg(callsign: str, cache: "EnrichmentCache") -> None:
             _pending.discard(f"rt:{callsign.upper()}")
 
 
-def lookup_route(callsign: Optional[str], cache: "EnrichmentCache") -> Optional[dict]:
-    """Return cached route immediately; fire background fetch if stale."""
+def lookup_route(callsign: Optional[str], cache: "EnrichmentCache", on_complete=None) -> Optional[dict]:
+    """Return cached route immediately; fire background fetch if stale.
+
+    on_complete(data) is called from the background thread when a fresh fetch
+    lands — use it to push data into the UI without waiting for the next cycle.
+    """
     if not callsign:
         return None
     cached = cache.get_route(callsign)
@@ -151,6 +170,6 @@ def lookup_route(callsign: Optional[str], cache: "EnrichmentCache") -> Optional[
         if key not in _pending:
             _pending.add(key)
             threading.Thread(
-                target=_fetch_route_bg, args=(callsign, cache), daemon=True
+                target=_fetch_route_bg, args=(callsign, cache, on_complete), daemon=True
             ).start()
     return None
