@@ -22,6 +22,30 @@ def estimate_speech_seconds(text: str, wpm: float = 150.0, gap: float = 0.8) -> 
     return words / wpm * 60.0 + gap
 
 
+def audio_duration_seconds(path: str, fallback: float = 0.0) -> float:
+    """Return the actual audio duration of *path* via ffprobe.
+
+    ffprobe ships with ffmpeg, which is already a project dependency.
+    On ANY failure (file missing, ffprobe not found, parse error) the
+    *fallback* value is returned instead of raising.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return fallback
+
+
 class Narrator:
     def __init__(self) -> None:
         self.provider = os.getenv("TTS_PROVIDER", "openai").strip().lower()
