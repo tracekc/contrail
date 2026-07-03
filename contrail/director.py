@@ -198,9 +198,10 @@ class IncidentTracker:
 
 
 class Director:
-    def __init__(self, client=None) -> None:
+    def __init__(self, client=None, memory=None) -> None:
         self.model = os.getenv("LLM_MODEL_LIVE", "claude-haiku-4-5-20251001")
         self._client = client  # injected anthropic.Anthropic (lazy if None)
+        self._memory = memory  # optional SessionMemory; None = no narrative memory
         self._recent: deque[str] = deque(maxlen=6)
         self._last_focus_hex: Optional[str] = None
         self._last_ambient_kind: Optional[str] = None
@@ -240,13 +241,18 @@ class Director:
         if focus.priority < EVENT_PRIORITY_FLOOR:
             self._last_ambient_kind = focus.kind
 
-        return ScriptLine(
+        line = ScriptLine(
             text=text,
             segment=segment,
             priority=focus.priority,
             aircraft=focus.aircraft,
             detail=focus.detail,
         )
+
+        if self._memory is not None:
+            self._memory.note_aired(line)
+
+        return line
 
     # ── segment / focus selection ─────────────────────────────
     def _choose(self, candidates: list[StoryCandidate]) -> Optional[StoryCandidate]:
@@ -366,6 +372,14 @@ class Director:
         n = context.get("region_count")
         if n:
             lines.append(f"\nCONTEXT: {n} aircraft currently in the coverage region.")
+
+        if self._memory is not None:
+            snippets = self._memory.recall(focus, context)
+            if snippets:
+                lines.append(
+                    "\nMEMORY (only reference if it fits naturally — never force a callback):"
+                )
+                lines.extend(f"- {s}" for s in snippets)
 
         if self._recent:
             lines.append("\nRECENT LINES (do not repeat these phrasings):")
