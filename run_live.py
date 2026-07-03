@@ -119,6 +119,54 @@ def _fetch(client: AdsbClient, region: tuple) -> tuple[list[Aircraft], int]:
     return aircraft, len(region_ac)
 
 
+class _RegionPoller:
+    """Polls ADS-B for the current region on a background thread so the main
+    narration loop never blocks on the network (the 3 fetch calls used to land
+    in the gap between clips). The loop reads latest() instantly; region changes
+    call fetch_now() for immediate fresh data and to re-point the poller."""
+
+    def __init__(self, client: AdsbClient, region: tuple,
+                 interval: float, stop: threading.Event) -> None:
+        self._client = client
+        self._interval = max(1.0, interval)
+        self._stop = stop
+        self._lock = threading.Lock()
+        self._region = region
+        self._latest = _fetch(client, region)  # prime synchronously
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def latest(self) -> tuple[list[Aircraft], int]:
+        with self._lock:
+            return self._latest
+
+    def fetch_now(self, region: tuple) -> tuple[list[Aircraft], int]:
+        """Switch region and fetch synchronously — used on region changes where
+        the loop needs fresh data immediately (travel beat, emergency redirect)."""
+        with self._lock:
+            self._region = region
+        snap = _fetch(self._client, region)
+        if snap[0]:  # keep last good on an empty/failed fetch
+            with self._lock:
+                self._latest = snap
+        return self.latest()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            with self._lock:
+                region = self._region
+            try:
+                snap = _fetch(self._client, region)
+            except Exception as exc:
+                log.warning("poller fetch failed: %s", exc)
+                continue
+            if snap[0]:
+                with self._lock:
+                    self._latest = snap
+
+
 def _speak(line, narrator, streamer) -> None:
     """Play/queue a line's audio (or just pace the loop when silent)."""
     if line and narrator:
@@ -307,8 +355,12 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
     rotate_after = _next_rotation_delay()
 
     bounds = _region_bounds(cur_region)
-    aircraft, region_count = _fetch(client, cur_region)
-    last_poll = time.time()
+    # ADS-B polling runs on a background thread so the loop never blocks on the
+    # network (removes the fetch latency that used to sit between clips).
+    poller = _RegionPoller(client, cur_region, cfg.poll_interval, stop)
+    if not once:
+        poller.start()
+    aircraft, region_count = poller.latest()
     emergency_redirect = False  # True while we've shifted the map to a global emergency
 
     # ── streaming pipeline state ──────────────────────────────────────────────
@@ -347,12 +399,9 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
                 pending = None
             _speak(travel, narrator, streamer)
 
-            # Arrive: refetch the new region and resume.
+            # Arrive: refetch the new region (synchronously) and resume.
             bounds = _region_bounds(cur_region)
-            new_ac, new_rc = _fetch(client, cur_region)
-            if new_ac:
-                aircraft, region_count = new_ac, new_rc
-            last_poll = time.time()
+            aircraft, region_count = poller.fetch_now(cur_region)
             region_started = time.time()
             rotate_after = _next_rotation_delay()
             continue
@@ -380,12 +429,10 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
                 print(f"[{ts}Z] (nothing to say this cycle)")
             pending = None
 
-        # ── poll/fetch (overlaps the aired clip's playback) ───────────────────
-        if now - last_poll >= cfg.poll_interval:
-            new_ac, new_rc = _fetch(client, cur_region)
-            last_poll = now
-            if new_ac:  # keep the last good snapshot if a fetch fails (e.g. 429)
-                aircraft, region_count = new_ac, new_rc
+        # ── read the latest background-polled snapshot (no network here) ──────
+        snap = poller.latest()
+        if snap[0]:  # keep the last good snapshot if the poller has none yet
+            aircraft, region_count = snap
 
         ctx = {"region_count": region_count, "region_name": region.name}
         candidates = detector.detect(aircraft, ctx)
@@ -415,20 +462,14 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
                 )
                 cur_region = (eac.lat, eac.lon, 300.0)
                 bounds = _region_bounds(cur_region)
-                new_ac, new_rc = _fetch(client, cur_region)
-                if new_ac:
-                    aircraft, region_count = new_ac, new_rc
-                last_poll = time.time()
+                aircraft, region_count = poller.fetch_now(cur_region)
                 emergency_redirect = True
 
         if not director._incident.active and emergency_redirect:
             log.info("emergency redirect ended; returning to %s", region.name)
             cur_region = region.tuple
             bounds = _region_bounds(cur_region)
-            new_ac, new_rc = _fetch(client, cur_region)
-            if new_ac:
-                aircraft, region_count = new_ac, new_rc
-            last_poll = time.time()
+            aircraft, region_count = poller.fetch_now(cur_region)
             region_started = time.time()
             emergency_redirect = False
         # ─────────────────────────────────────────────────────────────────────
