@@ -33,6 +33,7 @@ from contrail.enrich import enrich_all, lookup_aircraft, lookup_route
 from contrail.enrich_cache import EnrichmentCache
 from contrail import photo_cache
 from contrail.ingest import AdsbClient
+from contrail.memory import SessionMemory
 from contrail.models import Aircraft
 from contrail.narrate import Narrator, estimate_speech_seconds, play
 
@@ -284,8 +285,12 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
     """
     client = AdsbClient(cfg.adsb_source)
     detector = EventDetector()
-    director = Director()
+    memory = SessionMemory()
+    memory.load()
+    director = Director(memory=memory)
     narrator = None if silent else Narrator()
+    _last_memory_save = time.time()
+    _MEMORY_SAVE_INTERVAL = 300  # save memory every 5 minutes
 
     # Region rotation state.
     region_idx = 0
@@ -340,7 +345,14 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
 
         ctx = {"region_count": region_count, "region_name": region.name}
         candidates = detector.detect(aircraft, ctx)
+        memory.observe(aircraft, candidates)
         line = director.next_line(candidates, ctx, aircraft)
+
+        # Periodic memory save + prune (every _MEMORY_SAVE_INTERVAL seconds).
+        if now - _last_memory_save >= _MEMORY_SAVE_INTERVAL:
+            memory.prune(now)
+            memory.save()
+            _last_memory_save = now
 
         # ── global emergency redirect ─────────────────────────────────────────
         # When the incident tracker locks onto an emergency aircraft that lies
