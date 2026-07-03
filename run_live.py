@@ -34,7 +34,7 @@ from contrail.enrich_cache import EnrichmentCache
 from contrail import photo_cache
 from contrail.ingest import AdsbClient
 from contrail.models import Aircraft
-from contrail.narrate import Narrator, estimate_speech_seconds, play
+from contrail.narrate import Narrator, audio_duration_seconds, estimate_speech_seconds, play
 
 EMERGENCY_SQUAWKS = ("7700", "7600")
 STATE_PATH = Path(__file__).parent / "contrail" / "renderer" / "state.json"
@@ -281,6 +281,13 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
 
     Local mode plays audio inline (paces the loop). Stream mode hands audio to
     the streamer and lets speech duration pace the loop.
+
+    Streaming path (streamer is not None AND narrator is not None) uses a
+    one-step lookahead: while clip N plays, we generate (LLM + TTS) clip N+1
+    so it is ready to enqueue immediately when N finishes. Sleep is based on
+    the clip's ACTUAL audio duration (via ffprobe) rather than a text estimate,
+    eliminating the two sources of silent padding: duration mismatch and serial
+    LLM/synth latency.
     """
     client = AdsbClient(cfg.adsb_source)
     detector = EventDetector()
@@ -298,6 +305,17 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
     aircraft, region_count = _fetch(client, cur_region)
     last_poll = time.time()
     emergency_redirect = False  # True while we've shifted the map to a global emergency
+
+    # ── streaming pipeline state ──────────────────────────────────────────────
+    # pending holds the (line, aircraft_snapshot, candidates_snapshot,
+    # region_count_snapshot, bounds_snapshot, audio_path) for the line that has
+    # been LLM+TTS-generated but not yet enqueued. None on the first cycle.
+    # Only used when streamer is not None and narrator is not None.
+    _PendingClip = tuple  # (line, aircraft, candidates, region_count, bounds, audio_path)
+    pending: _PendingClip | None = None
+    # ─────────────────────────────────────────────────────────────────────────
+
+    _streaming = (streamer is not None and narrator is not None)
 
     while not stop.is_set():
         now = time.time()
@@ -320,6 +338,12 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
             _write_state(aircraft, travel, [], region_count, WORLD_BOUNDS)
             ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
             print(f"[{ts}Z] (travel) {travel.text}")
+
+            # Travel beat: flush any pending lookahead (it was for a different
+            # region/context) and use synchronous _speak for this one-off clip.
+            # After _speak returns we resume the pipeline from a clean state.
+            if _streaming:
+                pending = None
             _speak(travel, narrator, streamer)
 
             # Arrive: refetch the new region and resume.
@@ -365,6 +389,16 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
                 last_poll = time.time()
                 emergency_redirect = True
 
+                # Flush the pending lookahead — it was computed with the old
+                # bounds/region and must not be enqueued. The `line` produced
+                # above by director.next_line() already reflects the incident
+                # aircraft, and _write_state below will be called with the
+                # corrected bounds, so this cycle's line is still aired
+                # synchronously via _speak to ensure the state switch is
+                # immediate and visible on the frame that displays the incident.
+                if _streaming:
+                    pending = None
+
         if not director._incident.active and emergency_redirect:
             log.info("emergency redirect ended; returning to %s", region.name)
             cur_region = region.tuple
@@ -375,8 +409,82 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
             last_poll = time.time()
             region_started = time.time()
             emergency_redirect = False
+            # Also flush pending so the next cycle starts fresh from the
+            # restored region.
+            if _streaming:
+                pending = None
         # ─────────────────────────────────────────────────────────────────────
 
+        if once:
+            _write_state(aircraft, line, candidates, region_count, bounds)
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            if line:
+                tag = "EVENT" if line.segment == "event" else line.segment
+                print(f"[{ts}Z] ({tag}) {line.text}")
+            else:
+                print(f"[{ts}Z] (nothing to say this cycle)")
+            return
+
+        # ── streaming one-step lookahead path ─────────────────────────────────
+        if _streaming and pending is None:
+            # Pending was flushed (travel beat / emergency redirect) or this is
+            # the very first cycle. The current `line` has already advanced the
+            # director's internal state (_recent/_aired/_incident), so we must
+            # NOT call director.next_line() again for this cycle — just synth
+            # the line we already have and fall through to the synchronous speak
+            # so that we output SOMETHING without a gap.
+            pass
+
+        if _streaming:
+            # ── Step 1: air the pending clip (if any) ────────────────────────
+            clip_started: float | None = None
+            clip_dur: float | None = None
+
+            if pending is not None:
+                p_line, p_aircraft, p_candidates, p_rc, p_bounds, p_audio_path = pending
+                _write_state(p_aircraft, p_line, p_candidates, p_rc, p_bounds)
+                streamer.enqueue_audio(p_audio_path)
+                clip_started = time.monotonic()
+                clip_dur = audio_duration_seconds(
+                    p_audio_path,
+                    fallback=estimate_speech_seconds(p_line.text) if p_line else 5.0,
+                )
+                ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                if p_line:
+                    tag = "EVENT" if p_line.segment == "event" else p_line.segment
+                    print(f"[{ts}Z] ({tag}) {p_line.text}")
+                else:
+                    print(f"[{ts}Z] (nothing to say this cycle)")
+                pending = None
+
+            # ── Step 2: prepare NEXT clip (LLM + TTS) during playback ────────
+            # `line` and the associated aircraft/candidates snapshot were already
+            # computed at the top of this iteration — they represent the NEXT
+            # line to air. Synth it now so it is ready when the current clip ends.
+            next_audio_path: str | None = None
+            if line and narrator:
+                try:
+                    next_audio_path = narrator.synth(line.text)
+                except Exception as exc:
+                    log.warning("TTS failed for next line: %s", exc)
+            # Freeze a snapshot of the state that goes with this line.
+            pending = (line, list(aircraft), list(candidates), region_count, bounds, next_audio_path)
+
+            # ── Step 3: sleep for the remainder of the current clip ───────────
+            if clip_started is not None and clip_dur is not None:
+                elapsed = time.monotonic() - clip_started
+                sleep_for = max(0.0, clip_dur - elapsed)
+                if sleep_for > 0:
+                    stop.wait(timeout=sleep_for)
+            else:
+                # Nothing was aired this cycle (first cycle or just-flushed):
+                # pace with a short wait so the loop isn't spinning while we
+                # also don't have a clip queued yet.
+                stop.wait(timeout=5.0)
+            continue
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Non-streaming / silent path — unchanged.
         _write_state(aircraft, line, candidates, region_count, bounds)
 
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -385,9 +493,6 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
             print(f"[{ts}Z] ({tag}) {line.text}")
         else:
             print(f"[{ts}Z] (nothing to say this cycle)")
-
-        if once:
-            return
 
         _speak(line, narrator, streamer)
 
