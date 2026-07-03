@@ -10,12 +10,13 @@ Ratings are rough L/M/H judgments. Cost blends ongoing $ and build effort.
 
 | Idea | Summary | Feasibility | Impact | Cost | Status |
 |---|---|---|---|---|---|
-| Data enrichment (§3) | Routes, aircraft history, photos — mostly from free community APIs | High | High | Low (free) | 🔴 |
+| Data enrichment (§3) | Routes, aircraft history, photos — mostly from free community APIs | High | High | Low (free) | 🟢 |
 | Narrative memory (§1) | Remember featured planes/incidents; callbacks, arcs, records, recaps | Med | High | Low | 🟡 |
 | Real ATC audio | Real controller/pilot voices for the focus region — authenticity/drama | Med | High | Low–Med | 🔴 |
 | Anchor personality | Deepen Miles: running bits, opinions, live-chat interaction | High | Med–High | Low | 🟡 |
 | Real map basemap (§2) | MapLibre + self-hosted PMTiles; detailed tiles so motion reads | Med | Med | Med–High | 🔴 |
 | Hosting & cost for top-notch visuals (§4) | Basic hosting migrated to Hetzner CX33 (~$9.59/mo); GPU path still needed for real map tier | Med | Med | Med–High | 🟢 |
+| Global emergency redirect | Map shifts to any 7700/7600 worldwide, not just current region | High | High | Free | 🟢 |
 | Real stats | Make viewer count / "busiest airport" chips real, or hide them | High | Low–Med | Low | 🔴 |
 | Number-reading fix | Stop odd-altitude mangling ("thirteen-eight-five-zero") | High | Low | Low | 🔴 |
 | Temp-file cleanup | Delete narration .wav clips after ffmpeg reads them | High | Low (reliability) | Low | 🔴 |
@@ -162,9 +163,11 @@ It moves the machine requirement from "runs on anything" to "wants a capable box
 
 ---
 
-## 3. Data sources & enrichment 🔴
+## 3. Data sources & enrichment 🟢
 
-**Problem it solves.** Today we have callsign + position + a basic bundled
+**Current state (2026-07-03):** Built and deployed. adsbdb.com gives registration, operator, built year. Planespotters.net gives photo + credit. Both are disk-cached in `enrichment_cache.json` (30-day prune, 24h route TTL). Photos downloaded to `renderer/photos/<hex>.jpg`, max 200 with LRU eviction. Tracking panel redesigned to show photo (or "No photo found" placeholder), reg/age badges, FROM/TO airport names. Background-thread lookups push data into `state.json` immediately on completion (~5–10s) rather than waiting for the next narration cycle.
+
+**Problem it solved.** Today we have callsign + position + a basic bundled
 aircraft DB (reg/type). Missing: routes (origin/destination), aircraft history
 (age/operator/serial), and photos. Adding these makes the commentary far richer
 ("a 12-year-old 777 out of San Francisco, here's what she looks like") and is a
@@ -280,8 +283,9 @@ Add LLM (Haiku) ~$50–150/mo; TTS $0 (Piper runs on the box). All-in:
 
 ## Suggested order (from the ranked assessment)
 1. Validate appeal cheaply (already live for a soak test).
-2. **Data enrichment (§3)** — cheap, high impact, and unlocks the rest.
-3. Fix the format's core weakness: **memory (§1)** + **real ATC audio**.
-4. Only if positioning as ambient beauty: **real map (§2)**.
-5. Harden for 24/7 (supervision/failover exist; add temp cleanup, etc.).
-6. Cost discipline — done (Edge TTS via Microsoft Neural cloud, Hetzner CX33 ~$9.59/mo).
+2. **Data enrichment (§3)** — done 🟢.
+3. **Global emergency redirect** — done 🟢.
+4. Fix the format's core weakness: **memory (§1)** + **real ATC audio**.
+5. Only if positioning as ambient beauty: **real map (§2)**.
+6. Harden for 24/7 (supervision/failover exist; add temp cleanup, etc.).
+7. Cost discipline — done (Edge TTS via Microsoft Neural cloud, Hetzner CX33 ~$9.59/mo).
