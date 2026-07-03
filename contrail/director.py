@@ -205,6 +205,9 @@ class Director:
         self._recent: deque[str] = deque(maxlen=6)
         self._last_focus_hex: Optional[str] = None
         self._last_ambient_kind: Optional[str] = None
+        # Aircraft type codes featured in the last few lines, so we don't run
+        # three A340 spotlights in a row when many rare types are aloft.
+        self._recent_types: deque[str] = deque(maxlen=4)
         self._aired: dict[str, float] = {}  # story key -> last-aired monotonic time
         self._incident = IncidentTracker()
 
@@ -238,6 +241,8 @@ class Director:
         self._prune()
         if focus.aircraft:
             self._last_focus_hex = focus.aircraft.hex
+            if focus.aircraft.type_code:
+                self._recent_types.append(focus.aircraft.type_code)
         if focus.priority < EVENT_PRIORITY_FLOOR:
             self._last_ambient_kind = focus.kind
 
@@ -269,10 +274,19 @@ class Director:
         ambient = [c for c in fresh if c.priority < EVENT_PRIORITY_FLOOR]
         if not ambient:
             return None
-        # Prefer a different kind than last, and not the aircraft we just featured.
+        # Prefer a fresh angle: a different kind than last, not the aircraft we
+        # just featured, and not the same aircraft TYPE we've featured in the
+        # last few lines (avoids back-to-back near-identical spotlights).
         for c in ambient:
             if c.kind == self._last_ambient_kind:
                 continue
+            if c.aircraft and c.aircraft.hex == self._last_focus_hex:
+                continue
+            if c.aircraft and c.aircraft.type_code and c.aircraft.type_code in self._recent_types:
+                continue
+            return c
+        # Relaxed fallback: still avoid repeating the exact same aircraft.
+        for c in ambient:
             if c.aircraft and c.aircraft.hex == self._last_focus_hex:
                 continue
             return c
@@ -348,8 +362,9 @@ class Director:
                 lines.append(f"- operator: {ac.airline}")
             if ac.type_desc:
                 lines.append(f"- type: {ac.type_desc}")
-            if ac.registration:
-                lines.append(f"- registration: {ac.registration}")
+            # Registration is shown on the on-screen panel, not spoken: the model
+            # tends to spell it out letter-by-letter, which sounds robotic. Keep
+            # it out of the prompt.
             if ac.altitude is not None:
                 lines.append(f"- altitude: {ac.altitude} ft")
             if ac.ground_speed is not None:

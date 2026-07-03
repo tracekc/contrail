@@ -61,6 +61,11 @@ ARC_MAX_EVENTS = 20             # cap per arc
 CALLBACK_EVERY_N = 4
 # Arc check-in: minimum seconds between mentioning the same arc.
 ARC_CHECKIN_MIN_S = 180
+# Only call back to an aircraft we featured at least this long ago — a callback
+# to something mentioned seconds earlier is meaningless.
+CALLBACK_MIN_AGE_S = 180
+# Session-record snippets are surfaced at most this often (in aired lines).
+RECORD_EVERY_N = 10
 
 # ── pruning ──────────────────────────────────────────────────────────────────
 FEATURED_MAX_AGE = 7200         # prune featured aircraft not seen for 2 h
@@ -147,7 +152,9 @@ class SessionMemory:
         self.arcs: dict[str, Arc] = {}
         self.records = SessionRecords()
         self._aired_count = 0           # total lines aired this session
-        self._last_callback_at_count = -CALLBACK_EVERY_N   # allows first callback immediately
+        # No callback until real history accrues (needs CALLBACK_EVERY_N lines first).
+        self._last_callback_at_count = 0
+        self._last_record_at_count = -RECORD_EVERY_N
 
     # ── observe ──────────────────────────────────────────────────────────────
 
@@ -334,58 +341,44 @@ class SessionMemory:
 
         focus_hex = focus.aircraft.hex if (focus and focus.aircraft) else None
 
-        # 1. Callback on the focus aircraft if it was featured before.
+        # 1. Continuity callback: the focus aircraft was featured a while ago and
+        #    is still with us. Phrased as a natural fact, no internal labels.
         if focus_hex and focus_hex in self.featured_aircraft:
             fa = self.featured_aircraft[focus_hex]
-            if fa.last_featured > 0 and (now - fa.last_featured) > 120:
+            if fa.last_featured > 0 and (now - fa.last_featured) > CALLBACK_MIN_AGE_S:
                 label = fa.callsign or fa.hex
-                type_str = f" ({fa.type_desc})" if fa.type_desc else ""
-                angle_str = _angle_label(fa.angle_used)
+                type_str = f", the {fa.type_desc}," if fa.type_desc else ""
                 results.append(
-                    f"We've featured {label}{type_str} before (angle: {angle_str}); "
-                    f"currently at {fa.alt} ft."
+                    f"You mentioned {label}{type_str} about {_ago(now - fa.last_featured)} — "
+                    f"it's still in view, now around {fa.alt} ft."
                 )
 
-        # 2. Arc status for the focus aircraft.
-        if focus_hex and focus_hex in self.arcs:
-            arc = self.arcs[focus_hex]
-            if arc.state in ("dormant",) and (now - arc.last_mentioned) > ARC_CHECKIN_MIN_S:
-                label = arc.callsign or focus_hex
-                results.append(
-                    f"Arc [{label}]: {arc.state} — last seen {_ago(now - arc.last_seen)}. "
-                    f"Events: {'; '.join(arc.events[-2:])}"
-                )
-            elif arc.state in ("open", "updating") and (now - arc.last_mentioned) > ARC_CHECKIN_MIN_S:
-                label = arc.callsign or focus_hex
-                results.append(
-                    f"Arc [{label}]: {arc.state} — {_ago(now - arc.opened_at)} in coverage."
-                )
+        # 2. Closure of a resolved incident on a DIFFERENT aircraft — a satisfying
+        #    callback ("that emergency from earlier landed safely").
+        if not results:
+            for hex_, arc in self.arcs.items():
+                if hex_ == focus_hex or arc.state != "closed" or not arc.events:
+                    continue
+                last_ev = arc.events[-1]
+                if any(k in last_ev for k in ("landed", "resolved", "cleared")):
+                    label = arc.callsign or hex_
+                    results.append(
+                        f"Earlier, {label}'s situation wrapped up {_ago(now - arc.last_seen)} — "
+                        f"{last_ev}."
+                    )
+                    break
 
-        # 3. Session record snippet (only if it's genuinely notable).
-        if len(results) < 2:
+        # 3. A session record — sparingly (at most every RECORD_EVERY_N lines).
+        if not results and (self._aired_count - self._last_record_at_count) >= RECORD_EVERY_N:
             record_snip = self._best_record_snippet(now)
             if record_snip:
                 results.append(record_snip)
-
-        # 4. Recent resolved arc / emergency resolution (from a DIFFERENT aircraft).
-        if len(results) < 2:
-            for hex_, arc in self.arcs.items():
-                if hex_ == focus_hex:
-                    continue
-                if arc.state == "closed" and arc.events:
-                    last_ev = arc.events[-1]
-                    if "landed" in last_ev or "resolved" in last_ev or "cleared" in last_ev:
-                        label = arc.callsign or hex_
-                        age = _ago(now - arc.last_seen)
-                        results.append(
-                            f"Earlier incident [{label}] resolved {age}: {last_ev}"
-                        )
-                        break
+                self._last_record_at_count = self._aired_count
 
         if results:
             self._last_callback_at_count = self._aired_count
 
-        return results[:3]  # hard cap
+        return results[:2]  # hard cap — keep the prompt lean
 
     def _best_record_snippet(self, now: float) -> Optional[str]:
         """Return one record snippet if there's something interesting to note."""
@@ -394,24 +387,22 @@ class SessionMemory:
         # Highest altitude
         if r.highest_alt and r.highest_alt_callsign:
             return (
-                f"Session high: {r.highest_alt_callsign} reached "
-                f"{r.highest_alt} ft tonight."
+                f"The highest we've tracked tonight is {r.highest_alt_callsign}, "
+                f"up at {r.highest_alt} ft."
             )
 
         # Notable type counts
         for code, count in r.notable_type_counts.items():
+            from .data.reference import RARE_TYPES
+            name = RARE_TYPES.get(code, code)
             if count >= 2:
-                from .data.reference import RARE_TYPES
-                name = RARE_TYPES.get(code, code)
-                return f"That's {count} {name}s seen this session."
+                return f"That's the {count}th {name} we've seen this session."
             elif count == 1:
-                from .data.reference import RARE_TYPES
-                name = RARE_TYPES.get(code, code)
-                return f"First {name} of the session."
+                return f"First {name} of the session so far."
 
         # Incident count
         if r.incident_count >= 2:
-            return f"{r.incident_count} incidents handled this session."
+            return f"We've followed {r.incident_count} incidents this session."
 
         return None
 
@@ -489,6 +480,7 @@ class SessionMemory:
             },
             "aired_count": self._aired_count,
             "last_callback_at_count": self._last_callback_at_count,
+            "last_record_at_count": self._last_record_at_count,
         }
         tmp = self._path.with_suffix(".json.tmp")
         try:
@@ -557,7 +549,8 @@ class SessionMemory:
             r.session_started = rd.get("session_started", r.session_started)
 
             self._aired_count = data.get("aired_count", 0)
-            self._last_callback_at_count = data.get("last_callback_at_count", -CALLBACK_EVERY_N)
+            self._last_callback_at_count = data.get("last_callback_at_count", 0)
+            self._last_record_at_count = data.get("last_record_at_count", -RECORD_EVERY_N)
 
             # Prune stale entries immediately on load
             self.prune(time.time())
