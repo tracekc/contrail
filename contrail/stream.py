@@ -43,6 +43,16 @@ BYTES_PER_SEC = SAMPLE_RATE * CHANNELS * 2  # s16le
 _SILENCE_CHUNK_S = 0.1
 _SILENCE = b"\x00" * int(BYTES_PER_SEC * _SILENCE_CHUNK_S)
 
+# If ffmpeg stops draining our frame writes for this long, something downstream
+# has stalled (typically the RTMP socket to YouTube blocking on a dead/slow
+# connection). A blocking stdin.write() has no timeout of its own, so without
+# this watchdog the frame thread — and therefore the whole session — can hang
+# forever even though the process looks "running" to systemd, silently
+# defeating the periodic supervisor restart. 20s is generous headroom over any
+# real fps interval (12fps = ~83ms/frame).
+STALL_TIMEOUT_S = 20.0
+_WATCHDOG_POLL_S = 3.0
+
 
 def ffmpeg_ok() -> bool:
     """True if ffmpeg actually runs (catches the broken-dylib case)."""
@@ -88,6 +98,7 @@ class LiveStreamer:
         self._stop = threading.Event()
         self._proc: Optional[subprocess.Popen] = None
         self._fifo_path: Optional[str] = None
+        self._last_frame_write = time.monotonic()
 
     # ── public ────────────────────────────────────────────────
     def enqueue_audio(self, path: str) -> None:
@@ -104,17 +115,39 @@ class LiveStreamer:
         self._proc = subprocess.Popen(
             self._ffmpeg_cmd(self._fifo_path), stdin=subprocess.PIPE
         )
+        self._last_frame_write = time.monotonic()
         audio_thread = threading.Thread(target=self._audio_loop, daemon=True)
         audio_thread.start()
+        watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
+        watchdog_thread.start()
         try:
             self._frame_loop()
         finally:
             self.stop()
             audio_thread.join(timeout=2)
+            watchdog_thread.join(timeout=2)
             self._cleanup()
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _watchdog_loop(self) -> None:
+        """Force-kill ffmpeg if frame writes stall (e.g. RTMP socket hung on a
+        dead connection). This unblocks the frame thread's stuck stdin.write()
+        with a clean BrokenPipeError, letting the normal session-teardown and
+        supervisor-restart path recover instead of hanging forever."""
+        while not self._stop.wait(_WATCHDOG_POLL_S):
+            stale_for = time.monotonic() - self._last_frame_write
+            if stale_for > STALL_TIMEOUT_S:
+                log.error(
+                    "frame writes stalled for %.0fs (ffmpeg not draining stdin — "
+                    "likely a stuck RTMP connection); killing ffmpeg to force a restart",
+                    stale_for,
+                )
+                if self._proc:
+                    with contextlib.suppress(Exception):
+                        self._proc.kill()
+                return
 
     # ── ffmpeg command ────────────────────────────────────────
     def _ffmpeg_cmd(self, fifo: str) -> list[str]:
@@ -176,6 +209,7 @@ class LiveStreamer:
                     self._proc.stdin.write(frame)
                 except (BrokenPipeError, ValueError):
                     break
+                self._last_frame_write = time.monotonic()
                 deadline += interval
                 sleep = deadline - time.monotonic()
                 if sleep > 0:
@@ -204,6 +238,7 @@ class LiveStreamer:
                             self._proc.stdin.write(png)
                         except (BrokenPipeError, ValueError):
                             break
+                        self._last_frame_write = time.monotonic()
                         deadline += interval
                         sleep = deadline - time.monotonic()
                         if sleep > 0:
