@@ -123,7 +123,7 @@ def _speak(line, narrator, streamer) -> None:
     """Play/queue a line's audio (or just pace the loop when silent)."""
     if line and narrator:
         try:
-            path = narrator.synth(line.text)
+            path = narrator.synth(line.text, segment=line.segment)
             if streamer:
                 streamer.enqueue_audio(path)
                 time.sleep(estimate_speech_seconds(line.text))
@@ -449,7 +449,7 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
             next_audio_path: str | None = None
             if line and narrator:
                 try:
-                    next_audio_path = narrator.synth(line.text)
+                    next_audio_path = narrator.synth(line.text, segment=line.segment)
                 except Exception as exc:
                     log.warning("TTS synth failed: %s", exc)
             pending = (line, list(aircraft), list(candidates), region_count, bounds, next_audio_path)

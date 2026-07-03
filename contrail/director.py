@@ -319,6 +319,14 @@ class Director:
         self, focus: StoryCandidate, segment: str, context: dict
     ) -> str:
         lines: list[str] = []
+        # Register cue — keep the written tone in step with the voice register.
+        if segment == "event":
+            lines.append("REGISTER: breaking-news — alert and focused, leaning in, "
+                         "with short punchy sentences; still calm and factual, never "
+                         "shrill or breathless.")
+        else:
+            lines.append("REGISTER: ambient companion — calm, warm and unhurried; "
+                         "you're gentle background company, not reading a bulletin.")
         if segment == "event":
             inc = focus.detail.get("incident", {})
             phase = inc.get("phase")

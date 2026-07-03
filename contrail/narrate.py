@@ -46,13 +46,37 @@ def audio_duration_seconds(path: str, fallback: float = 0.0) -> float:
         return fallback
 
 
+# Voice "register" per segment — the audible half of the calm-companion /
+# breaking-news split. Ambient is unhurried and warm; events lean in (a touch
+# faster) while staying calm and un-shrill (pitch stays neutral, never breathless).
+# Values are Edge TTS rate/pitch strings (must carry an explicit sign).
+_EDGE_STYLES = {
+    "ambient": {"rate": "-8%", "pitch": "+0Hz"},
+    "event":   {"rate": "+6%", "pitch": "+0Hz"},
+    "travel":  {"rate": "-6%", "pitch": "+0Hz"},
+}
+_EDGE_DEFAULT = {"rate": "+0%", "pitch": "+0Hz"}
+
+
+def _edge_style(segment: str | None) -> dict:
+    if segment == "event":
+        return _EDGE_STYLES["event"]
+    if segment == "travel":
+        return _EDGE_STYLES["travel"]
+    return _EDGE_STYLES["ambient"]
+
+
 class Narrator:
     def __init__(self) -> None:
         self.provider = os.getenv("TTS_PROVIDER", "openai").strip().lower()
         self._client = None
 
-    def synth(self, text: str, out_path: str | None = None) -> str:
-        """Synthesize `text` to an audio file, returning its path."""
+    def synth(self, text: str, out_path: str | None = None,
+              *, segment: str | None = None) -> str:
+        """Synthesize `text` to an audio file, returning its path.
+
+        `segment` selects a voice register (calm ambient vs alert event) for
+        providers that support it (currently Edge TTS)."""
         if out_path is None:
             # Local TTS emits WAV; the cloud providers emit MP3. ffmpeg/afplay
             # both sniff content, so the extension is cosmetic, but keep it right.
@@ -66,7 +90,7 @@ class Narrator:
         elif self.provider == "local":
             self._synth_local(text, out_path)
         elif self.provider == "edge":
-            self._synth_edge(text, out_path)
+            self._synth_edge(text, out_path, segment)
         else:
             raise ValueError(f"Unknown TTS_PROVIDER: {self.provider!r}")
         return out_path
@@ -131,12 +155,17 @@ class Narrator:
                 if chunk:
                     f.write(chunk)
 
-    def _synth_edge(self, text: str, out_path: str) -> None:
+    def _synth_edge(self, text: str, out_path: str, segment: str | None = None) -> None:
         import asyncio
         import edge_tts
 
         voice = os.getenv("EDGE_TTS_VOICE", "en-GB-RyanNeural")
-        asyncio.run(edge_tts.Communicate(text, voice).save(out_path))
+        style = _edge_style(segment)
+        asyncio.run(
+            edge_tts.Communicate(
+                text, voice, rate=style["rate"], pitch=style["pitch"]
+            ).save(out_path)
+        )
 
 
 def play(path: str) -> None:
