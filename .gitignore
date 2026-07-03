@@ -16,6 +16,12 @@ skywatch.log
 contrail/renderer/state.json
 contrail/renderer/test_frame.png
 contrail/renderer/native_frame.png
+contrail/renderer/enrichment_cache.json
+contrail/renderer/photos/
+contrail/memory_store.json
+
+# Agent worktrees
+.claude/worktrees/
 
 # Generated media / test output
 *.mp4

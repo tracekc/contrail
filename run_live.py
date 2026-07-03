@@ -402,12 +402,10 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
                 emergency_redirect = True
 
                 # Flush the pending lookahead — it was computed with the old
-                # bounds/region and must not be enqueued. The `line` produced
-                # above by director.next_line() already reflects the incident
-                # aircraft, and _write_state below will be called with the
-                # corrected bounds, so this cycle's line is still aired
-                # synchronously via _speak to ensure the state switch is
-                # immediate and visible on the frame that displays the incident.
+                # bounds/region and must not be enqueued. This cycle's `line`
+                # (already reflecting the incident aircraft) is re-synthesized
+                # below with the corrected bounds; the incident becomes visible
+                # on the next aired clip (one clip of lag, ~5s).
                 if _streaming:
                     pending = None
 
@@ -438,15 +436,9 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
             return
 
         # ── streaming one-step lookahead path ─────────────────────────────────
-        if _streaming and pending is None:
-            # Pending was flushed (travel beat / emergency redirect) or this is
-            # the very first cycle. The current `line` has already advanced the
-            # director's internal state (_recent/_aired/_incident), so we must
-            # NOT call director.next_line() again for this cycle — just synth
-            # the line we already have and fall through to the synchronous speak
-            # so that we output SOMETHING without a gap.
-            pass
-
+        # When pending is None (first cycle, or just flushed by a travel beat /
+        # emergency redirect), Step 1 airs nothing and Step 2 primes `line` for
+        # the next cycle — costing one short priming wait, not a dropped line.
         if _streaming:
             # ── Step 1: air the pending clip (if any) ────────────────────────
             clip_started: float | None = None

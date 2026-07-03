@@ -1,0 +1,4 @@
+# Dev / test dependencies (not needed to run the stream).
+#   pip install -r requirements-dev.txt
+#   python -m pytest tests/
+pytest>=8.0
