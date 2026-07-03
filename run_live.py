@@ -334,19 +334,15 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
             region = REGIONS[region_idx]
             cur_region = region.tuple
 
-            # Globe beat: one line on the world map while we "travel" there. The
-            # renderer eases the camera out to WORLD_BOUNDS, then into the next
-            # region on the following cycle.
+            # Globe beat: one line on the world map while we "travel" there. In
+            # streaming mode we drop any prepared clip and speak the travel line
+            # synchronously — it's a deliberate, infrequent transition beat.
             travel = ScriptLine(
                 text=random.choice(_TRAVEL_LINES).format(old=old_name, new=region.name),
                 segment="travel", priority=0)
             _write_state(aircraft, travel, [], region_count, WORLD_BOUNDS)
             ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
             print(f"[{ts}Z] (travel) {travel.text}")
-
-            # Travel beat: flush any pending lookahead (it was for a different
-            # region/context) and use synchronous _speak for this one-off clip.
-            # After _speak returns we resume the pipeline from a clean state.
             if _streaming:
                 pending = None
             _speak(travel, narrator, streamer)
@@ -361,6 +357,30 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
             rotate_after = _next_rotation_delay()
             continue
 
+        # ── STREAMING: air the previously-prepared clip FIRST ─────────────────
+        # Enqueuing the clip up front means the ~fetch+LLM+synth work below runs
+        # DURING this clip's playback, not in the gap after it. Sleep at the end
+        # only covers the remainder of the clip, so clips play back-to-back.
+        clip_started: float | None = None
+        clip_dur: float | None = None
+        if _streaming and pending is not None:
+            p_line, p_aircraft, p_candidates, p_rc, p_bounds, p_audio_path = pending
+            _write_state(p_aircraft, p_line, p_candidates, p_rc, p_bounds)
+            streamer.enqueue_audio(p_audio_path)
+            clip_started = time.monotonic()
+            clip_dur = audio_duration_seconds(
+                p_audio_path,
+                fallback=estimate_speech_seconds(p_line.text) if p_line else 5.0,
+            )
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            if p_line:
+                tag = "EVENT" if p_line.segment == "event" else p_line.segment
+                print(f"[{ts}Z] ({tag}) {p_line.text}")
+            else:
+                print(f"[{ts}Z] (nothing to say this cycle)")
+            pending = None
+
+        # ── poll/fetch (overlaps the aired clip's playback) ───────────────────
         if now - last_poll >= cfg.poll_interval:
             new_ac, new_rc = _fetch(client, cur_region)
             last_poll = now
@@ -383,7 +403,7 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
         # outside the current map view, shift the whole channel to that location:
         # update bounds (what the map renders), cur_region (what the next fetch
         # pulls), and do an immediate refetch so the area fills with real traffic.
-        # When the incident clears, return to the scheduled named region.
+        # The shift takes effect on the clip prepared below (aired next cycle).
         eac = director._incident.last_ac if director._incident.active else None
         if eac and eac.lat is not None and eac.lon is not None:
             w, s, e, n = bounds
@@ -401,14 +421,6 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
                 last_poll = time.time()
                 emergency_redirect = True
 
-                # Flush the pending lookahead — it was computed with the old
-                # bounds/region and must not be enqueued. This cycle's `line`
-                # (already reflecting the incident aircraft) is re-synthesized
-                # below with the corrected bounds; the incident becomes visible
-                # on the next aired clip (one clip of lag, ~5s).
-                if _streaming:
-                    pending = None
-
         if not director._incident.active and emergency_redirect:
             log.info("emergency redirect ended; returning to %s", region.name)
             cur_region = region.tuple
@@ -419,10 +431,6 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
             last_poll = time.time()
             region_started = time.time()
             emergency_redirect = False
-            # Also flush pending so the next cycle starts fresh from the
-            # restored region.
-            if _streaming:
-                pending = None
         # ─────────────────────────────────────────────────────────────────────
 
         if once:
@@ -435,56 +443,26 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
                 print(f"[{ts}Z] (nothing to say this cycle)")
             return
 
-        # ── streaming one-step lookahead path ─────────────────────────────────
-        # When pending is None (first cycle, or just flushed by a travel beat /
-        # emergency redirect), Step 1 airs nothing and Step 2 primes `line` for
-        # the next cycle — costing one short priming wait, not a dropped line.
+        # ── STREAMING: prepare the next clip (LLM already done above; synth now),
+        #    stash it, then sleep only the remainder of the current clip ────────
         if _streaming:
-            # ── Step 1: air the pending clip (if any) ────────────────────────
-            clip_started: float | None = None
-            clip_dur: float | None = None
-
-            if pending is not None:
-                p_line, p_aircraft, p_candidates, p_rc, p_bounds, p_audio_path = pending
-                _write_state(p_aircraft, p_line, p_candidates, p_rc, p_bounds)
-                streamer.enqueue_audio(p_audio_path)
-                clip_started = time.monotonic()
-                clip_dur = audio_duration_seconds(
-                    p_audio_path,
-                    fallback=estimate_speech_seconds(p_line.text) if p_line else 5.0,
-                )
-                ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                if p_line:
-                    tag = "EVENT" if p_line.segment == "event" else p_line.segment
-                    print(f"[{ts}Z] ({tag}) {p_line.text}")
-                else:
-                    print(f"[{ts}Z] (nothing to say this cycle)")
-                pending = None
-
-            # ── Step 2: prepare NEXT clip (LLM + TTS) during playback ────────
-            # `line` and the associated aircraft/candidates snapshot were already
-            # computed at the top of this iteration — they represent the NEXT
-            # line to air. Synth it now so it is ready when the current clip ends.
             next_audio_path: str | None = None
             if line and narrator:
                 try:
                     next_audio_path = narrator.synth(line.text)
                 except Exception as exc:
-                    log.warning("TTS failed for next line: %s", exc)
-            # Freeze a snapshot of the state that goes with this line.
+                    log.warning("TTS synth failed: %s", exc)
             pending = (line, list(aircraft), list(candidates), region_count, bounds, next_audio_path)
 
-            # ── Step 3: sleep for the remainder of the current clip ───────────
             if clip_started is not None and clip_dur is not None:
-                elapsed = time.monotonic() - clip_started
-                sleep_for = max(0.0, clip_dur - elapsed)
+                sleep_for = max(0.0, clip_dur - (time.monotonic() - clip_started))
                 if sleep_for > 0:
                     stop.wait(timeout=sleep_for)
-            else:
-                # Nothing was aired this cycle (first cycle or just-flushed):
-                # pace with a short wait so the loop isn't spinning while we
-                # also don't have a clip queued yet.
-                stop.wait(timeout=5.0)
+            elif next_audio_path is None:
+                # Nothing aired and nothing primed (e.g. a quiet cycle): pace so
+                # we don't hot-spin. When a clip WAS primed we loop straight back
+                # to air it, minimising startup / post-transition latency.
+                stop.wait(timeout=3.0)
             continue
         # ─────────────────────────────────────────────────────────────────────
 
