@@ -41,6 +41,12 @@ EMERGENCY_SQUAWKS = ("7700", "7600")
 STATE_PATH = Path(__file__).parent / "contrail" / "renderer" / "state.json"
 MAX_PLOTTED = 200
 _STATE_LOCK = threading.Lock()
+# Absolute floor on the streaming pipeline's per-cycle pace, regardless of how
+# clip-duration math works out. Without this, a slow LLM/TTS call (prep time
+# exceeding the clip it was meant to overlap) causes the loop to spin with
+# zero delay into another full cycle — starving the frame-writer thread of
+# CPU under sustained conditions.
+MIN_CYCLE_SLEEP_S = 1.5
 
 # Globe "travel beat": when rotating regions we pull all the way out to the world
 # before zooming into the next region. Equirectangular-friendly world extent.
@@ -496,14 +502,30 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
             pending = (line, list(aircraft), list(candidates), region_count, bounds, next_audio_path)
 
             if clip_started is not None and clip_dur is not None:
-                sleep_for = max(0.0, clip_dur - (time.monotonic() - clip_started))
-                if sleep_for > 0:
-                    stop.wait(timeout=sleep_for)
-            elif next_audio_path is None:
-                # Nothing aired and nothing primed (e.g. a quiet cycle): pace so
-                # we don't hot-spin. When a clip WAS primed we loop straight back
-                # to air it, minimising startup / post-transition latency.
-                stop.wait(timeout=3.0)
+                elapsed = time.monotonic() - clip_started
+                sleep_for = clip_dur - elapsed
+                if sleep_for < MIN_CYCLE_SLEEP_S:
+                    if sleep_for < 0:
+                        # LLM+TTS prep took longer than the clip it was meant to
+                        # overlap. Without a floor here the loop spins straight
+                        # into another full cycle (poll/detect/LLM/TTS) with zero
+                        # pacing — a sustained occurrence of this starves the
+                        # frame-writer thread of CPU and can trip the stall
+                        # watchdog. Log it so slow-LLM regressions are visible.
+                        log.warning(
+                            "narration prep took %.1fs, exceeding the %.1fs clip "
+                            "it was meant to overlap; pacing with a floor sleep "
+                            "instead of spinning",
+                            elapsed, clip_dur,
+                        )
+                    sleep_for = MIN_CYCLE_SLEEP_S
+                stop.wait(timeout=sleep_for)
+            else:
+                # Nothing aired this cycle (first cycle, or right after a
+                # travel-beat / emergency-redirect flush). Pace regardless of
+                # whether a clip was just primed, so the loop can never spin
+                # with zero delay.
+                stop.wait(timeout=3.0 if next_audio_path is None else MIN_CYCLE_SLEEP_S)
             continue
         # ─────────────────────────────────────────────────────────────────────
 
