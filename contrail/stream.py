@@ -162,8 +162,17 @@ class LiveStreamer:
     def _ffmpeg_cmd(self, fifo: str) -> list[str]:
         cmd = [
             "ffmpeg", "-y",
-            # JPEG frames from native Skia renderer or Playwright screenshot
-            "-f", "image2pipe", "-vcodec", "mjpeg", "-framerate", str(self.fps), "-i", "pipe:0",
+            # JPEG frames from native Skia renderer or Playwright screenshot.
+            # -video_size is set explicitly (frame size is fixed) so ffmpeg
+            # never needs to probe the mjpeg stream to determine dimensions.
+            # Observed on ffmpeg 8.0.1: without it, the image2pipe demuxer can
+            # fail entirely ("Could not find codec parameters ... unspecified
+            # size"), never starts draining stdin, and every frame write then
+            # blocks on the full pipe buffer until the stall watchdog fires —
+            # 100% reproducible, independent of fps or RTMP/network health.
+            "-f", "image2pipe", "-vcodec", "mjpeg", "-video_size", f"{WIDTH}x{HEIGHT}",
+            "-analyzeduration", "1000000", "-probesize", "1000000",
+            "-framerate", str(self.fps), "-i", "pipe:0",
             # audio: raw PCM from the FIFO
             "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS), "-i", fifo,
             "-c:v", "libx264", "-preset", "veryfast",
