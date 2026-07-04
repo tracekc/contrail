@@ -15,8 +15,10 @@ reliability (no browser, no CDN fetch, no memory growth).
 """
 from __future__ import annotations
 
+import functools
 import json
 import math
+import os
 import time
 import urllib.request
 from pathlib import Path
@@ -70,7 +72,40 @@ FOCUS_COLOR_NORMAL = _c("#3ddc84")
 MUTED_COLOR = _c("#5a6678")
 
 
+# Explicit font files, tried in order per weight. Skia's family-name lookup
+# silently falls back to a system default on Linux (no Helvetica/Arial there),
+# which is why the stream's text rendered with an unexpected font. Loading a
+# real file by path makes rendering deterministic across macOS and the Linux
+# host. Override with CONTRAIL_FONT_REGULAR / CONTRAIL_FONT_BOLD if desired.
+_FONT_FILES = {
+    False: [
+        os.getenv("CONTRAIL_FONT_REGULAR"),
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ],
+    True: [
+        os.getenv("CONTRAIL_FONT_BOLD"),
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ],
+}
+
+
+@functools.lru_cache(maxsize=4)
 def _typeface(bold: bool = False) -> skia.Typeface:
+    # Prefer an explicit font file (deterministic). Any failure falls through
+    # to the next candidate, and finally to the family-name lookup, so this can
+    # never raise or hang — worst case it matches the previous behaviour.
+    for path in _FONT_FILES[bold]:
+        if path and os.path.exists(path):
+            try:
+                tf = skia.Typeface.MakeFromFile(path)
+                if tf is not None:
+                    return tf
+            except Exception:
+                pass
     style = skia.FontStyle.Bold() if bold else skia.FontStyle.Normal()
     for name in ("Helvetica Neue", "Helvetica", "Arial"):
         tf = skia.Typeface(name, style)
