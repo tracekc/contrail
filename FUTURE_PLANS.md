@@ -11,9 +11,15 @@ Ratings are rough L/M/H judgments. Cost blends ongoing $ and build effort.
 | Idea | Summary | Feasibility | Impact | Cost | Status |
 |---|---|---|---|---|---|
 | Data enrichment (§3) | Routes, aircraft history, photos — mostly from free community APIs | High | High | Low (free) | 🟢 |
-| Narrative memory (§1) | Remember featured planes/incidents; callbacks, arcs, records, recaps | Med | High | Low | 🟡 |
+| Narrative memory (§1) | Featured planes/incidents; callbacks, arcs, records, new-viewer recaps | Med | High | Low | 🟢 |
+| Register split | Calm ambient vs alert breaking-news voice+phrasing (Edge TTS rate/pitch by segment) | High | High | Free | 🟢 |
+| Narration pipeline tightening | One-step lookahead, async ADS-B poll, min-pace floor — clips play back-to-back | High | High | Free | 🟢 |
+| LLM cost migration | Anthropic billing ran out → OpenRouter / DeepSeek V4 Flash (LLM_PROVIDER switch) | High | High | Low | 🟢 |
+| Stream reliability | Render-hang fix, stall watchdog (os._exit + systemd), ffmpeg -video_size, font loading | High | High | Free | 🟢 |
 | Real ATC audio | Real controller/pilot voices for the focus region — authenticity/drama | Med | High | Low–Med | 🔴 |
 | Anchor personality | Deepen Miles: running bits, opinions, live-chat interaction | High | Med–High | Low | 🟡 |
+| Anticipation→payoff | "Rare type inbound… we'll watch for it," then deliver the callback | Med | High | Low | 🔴 |
+| Type-level photo fallback | Same-type / silhouette photo when a specific airframe has none | High | Low–Med | Low | 🔴 |
 | Real map basemap (§2) | MapLibre + self-hosted PMTiles; detailed tiles so motion reads | Med | Med | Med–High | 🔴 |
 | Hosting & cost for top-notch visuals (§4) | Basic hosting migrated to Hetzner CX33 (~$9.59/mo); GPU path still needed for real map tier | Med | Med | Med–High | 🟢 |
 | Global emergency redirect | Map shifts to any 7700/7600 worldwide, not just current region | High | High | Free | 🟢 |
@@ -22,11 +28,15 @@ Ratings are rough L/M/H judgments. Cost blends ongoing $ and build effort.
 | Temp-file cleanup | Delete narration .wav clips after ffmpeg reads them | High | Low (reliability) | Low | 🔴 |
 | Edge TTS | Replaced Piper ONNX; zero local CPU, eliminates stop-motion stalls | High | High | Free | 🟢 |
 
-Rough priority (see full reasoning at bottom): data enrichment → memory → real ATC → personality → real map. The last four rows are small hygiene/quality fixes to fold in opportunistically.
+**Current state (2026-07-04):** Live and stable on Hetzner. Phases 0–3 of the narration plan shipped — content correctness, register split, pipeline timing, and narrative continuity (callbacks, arcs, resolution beats, new-viewer recaps). Data enrichment (routes/history/photos) working; photo hit rate fixed from ~7% to real coverage by stopping negative-caching of Planespotters throttle responses. LLM moved off Anthropic (billing) to OpenRouter/DeepSeek V4 Flash. A day of reliability hardening resolved a render-thread infinite loop, hung-RTMP stalls (watchdog now force-restarts via systemd), ffmpeg input probing, and Linux font fallback.
+
+Remaining, roughly prioritized: **real ATC audio** (biggest authenticity lever) → **anchor personality / live-chat** → optional polish (anticipation→payoff, type-level photo fallback, real stats, number-reading, temp-file cleanup) → **real map (§2)** only if pursuing ambient-beauty positioning.
 
 ---
 
-## 1. Narrative memory for the commentary 🟡
+## 1. Narrative memory for the commentary 🟢
+
+**Built (2026-07-04):** `contrail/memory.py` `SessionMemory` — structured facts only (no LLM prose), persisted to `memory_store.json` across restarts. Tracks featured aircraft, arcs (open→updating→dormant→closed), and session records. `recall()` injects a few relevant snippets into the director prompt with cadence guards: continuity callbacks (aged, "still in view"), resolved-incident closure, sparing session records, and "if you're just joining us" recaps on a slower cadence. Wired into `Director` (guarded, optional). Only anticipation→payoff was deferred. Original design notes below.
 
 **Problem it solves.** Right now Miles (the anchor) has amnesia. Every line is
 generated fresh from the current snapshot. The only existing memory is shallow:
@@ -282,10 +292,14 @@ Add LLM (Haiku) ~$50–150/mo; TTS $0 (Piper runs on the box). All-in:
 ---
 
 ## Suggested order (from the ranked assessment)
-1. Validate appeal cheaply (already live for a soak test).
-2. **Data enrichment (§3)** — done 🟢.
+1. Validate appeal cheaply (already live for a soak test). ✅ live on Hetzner
+2. **Data enrichment (§3)** — done 🟢 (incl. photo negative-cache fix).
 3. **Global emergency redirect** — done 🟢.
-4. Fix the format's core weakness: **memory (§1)** + **real ATC audio**.
-5. Only if positioning as ambient beauty: **real map (§2)**.
-6. Harden for 24/7 (supervision/failover exist; add temp cleanup, etc.).
-7. Cost discipline — done (Edge TTS via Microsoft Neural cloud, Hetzner CX33 ~$9.59/mo).
+4. **Narrative memory (§1)** — done 🟢 (callbacks, arcs, recaps; anticipation→payoff deferred).
+5. **Narration pipeline + register split + reliability hardening** — done 🟢.
+6. **Real ATC audio** — next: the biggest remaining authenticity/drama lever.
+7. **Anchor personality / live-chat interaction** — engagement lever (Neuro-sama-style).
+8. Only if positioning as ambient beauty: **real map (§2)**.
+9. Cost discipline — done (Edge TTS; OpenRouter/DeepSeek after Anthropic billing ran out; Hetzner CX33 ~$9.59/mo).
+
+**Target audience (decided):** calm "ambient aviation companion" for background viewing among the aviation-curious, with emergency-redirect moments as the occasional attention-grabbing / shareable spike. Register split serves exactly this.
