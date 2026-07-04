@@ -66,6 +66,11 @@ ARC_CHECKIN_MIN_S = 180
 CALLBACK_MIN_AGE_S = 180
 # Session-record snippets are surfaced at most this often (in aired lines).
 RECORD_EVERY_N = 10
+# Offer a "if you're just joining us" recap for new viewers at most this often.
+RECAP_EVERY_N = 25
+# Don't recap until the session has been on air at least this long (secs) —
+# a recap five minutes in has nothing to summarise.
+RECAP_MIN_SESSION_S = 1800
 
 # ── pruning ──────────────────────────────────────────────────────────────────
 FEATURED_MAX_AGE = 7200         # prune featured aircraft not seen for 2 h
@@ -155,6 +160,7 @@ class SessionMemory:
         # No callback until real history accrues (needs CALLBACK_EVERY_N lines first).
         self._last_callback_at_count = 0
         self._last_record_at_count = -RECORD_EVERY_N
+        self._last_recap_at_count = 0
 
     # ── observe ──────────────────────────────────────────────────────────────
 
@@ -334,6 +340,16 @@ class SessionMemory:
         now = time.time()
         results: list[str] = []
 
+        # Session recap for new viewers ("if you're just joining us…"). Runs on
+        # its own slower cadence, independent of the callback guard, since a
+        # 24/7 stream always has people dropping in mid-session.
+        if (self._aired_count - self._last_recap_at_count) >= RECAP_EVERY_N:
+            recap = self._session_recap(now)
+            if recap:
+                self._last_recap_at_count = self._aired_count
+                self._last_callback_at_count = self._aired_count
+                return [recap]
+
         # Cadence guard: only allow a callback every CALLBACK_EVERY_N aired lines.
         lines_since_last = self._aired_count - self._last_callback_at_count
         if lines_since_last < CALLBACK_EVERY_N:
@@ -379,6 +395,37 @@ class SessionMemory:
             self._last_callback_at_count = self._aired_count
 
         return results[:2]  # hard cap — keep the prompt lean
+
+    def _session_recap(self, now: float) -> Optional[str]:
+        """Build a factual session-summary snippet for a 'just joining us' recap,
+        or None if the session is too young / too quiet to be worth recapping."""
+        r = self.records
+        dur_s = now - r.session_started
+        if dur_s < RECAP_MIN_SESSION_S:
+            return None
+
+        bits: list[str] = []
+        hrs = dur_s / 3600.0
+        if hrs >= 1:
+            bits.append(f"on air about {round(hrs)} hour{'s' if round(hrs) != 1 else ''}")
+        else:
+            bits.append(f"on air about {int(dur_s / 60)} minutes")
+
+        notable = sum(r.notable_type_counts.values())
+        if notable:
+            bits.append(f"{notable} notable aircraft featured")
+        if r.incident_count:
+            bits.append(f"{r.incident_count} incident{'s' if r.incident_count != 1 else ''} followed")
+        if r.busiest_count:
+            bits.append(f"peak traffic around {r.busiest_count} aircraft")
+
+        # Need more than just the "on air" bit for a recap to be worthwhile.
+        if len(bits) < 2:
+            return None
+        return (
+            "SESSION SO FAR (you may open with a brief 'if you're just joining us' "
+            "recap, only if it fits naturally): " + "; ".join(bits) + "."
+        )
 
     def _best_record_snippet(self, now: float) -> Optional[str]:
         """Return one record snippet if there's something interesting to note."""
@@ -481,6 +528,7 @@ class SessionMemory:
             "aired_count": self._aired_count,
             "last_callback_at_count": self._last_callback_at_count,
             "last_record_at_count": self._last_record_at_count,
+            "last_recap_at_count": self._last_recap_at_count,
         }
         tmp = self._path.with_suffix(".json.tmp")
         try:
@@ -551,6 +599,7 @@ class SessionMemory:
             self._aired_count = data.get("aired_count", 0)
             self._last_callback_at_count = data.get("last_callback_at_count", 0)
             self._last_record_at_count = data.get("last_record_at_count", -RECORD_EVERY_N)
+            self._last_recap_at_count = data.get("last_recap_at_count", self._aired_count)
 
             # Prune stale entries immediately on load
             self.prune(time.time())

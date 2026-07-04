@@ -20,6 +20,19 @@ from .models import Aircraft, StoryCandidate
 
 log = logging.getLogger(__name__)
 
+# Pre-import the LLM client SDKs at module load (process startup, before the
+# stream launches) so their slow import cost isn't paid on the first narration
+# call after a restart — which previously delayed the first spoken line by
+# several seconds. Both are optional; whichever provider is unused can be absent.
+try:
+    from openai import OpenAI as _OpenAI
+except Exception:  # pragma: no cover - only hit if openai isn't installed
+    _OpenAI = None
+try:
+    import anthropic as _anthropic
+except Exception:  # pragma: no cover - only hit if anthropic isn't installed
+    _anthropic = None
+
 EVENT_PRIORITY_FLOOR = 70  # candidates at/above this trigger a locked "event" segment
 
 # How long after airing a story before we'll air "the same" one again.
@@ -423,8 +436,7 @@ class Director:
     def _ensure_client(self):
         if self._client is None:
             if self.provider == "openrouter":
-                from openai import OpenAI
-
+                OpenAI = _OpenAI or __import__("openai").OpenAI
                 self._client = OpenAI(
                     base_url="https://openrouter.ai/api/v1",
                     api_key=os.getenv("OPENROUTER_API_KEY"),
@@ -434,8 +446,7 @@ class Director:
                     },
                 )
             else:
-                import anthropic
-
+                anthropic = _anthropic or __import__("anthropic")
                 self._client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
         return self._client
 

@@ -12,6 +12,8 @@ import pytest
 from contrail.memory import (
     CALLBACK_EVERY_N,
     ARC_DORMANT_AFTER,
+    RECAP_EVERY_N,
+    RECAP_MIN_SESSION_S,
     SALIENCE_FEATURED_MIN,
     SALIENCE_ARC_MIN,
     SessionMemory,
@@ -358,6 +360,60 @@ class TestRecall:
         for s in snippets:
             assert isinstance(s, str)
             assert len(s) > 0
+
+
+# ── session recap (new-viewer bookend) ────────────────────────────────────────
+
+class TestRecap:
+    def _prime_session(self, mem: SessionMemory) -> None:
+        """An old-enough, eventful session so a recap is warranted."""
+        mem.records.session_started = time.time() - (RECAP_MIN_SESSION_S + 600)
+        mem.records.notable_type_counts = {"A388": 2, "B744": 1}
+        mem.records.incident_count = 1
+        mem.records.busiest_count = 640
+
+    def test_recap_fires_when_due(self, tmp_path):
+        mem = _make_memory(tmp_path)
+        self._prime_session(mem)
+        mem._aired_count = RECAP_EVERY_N
+        mem._last_recap_at_count = 0
+        snippets = mem.recall(None, {})
+        assert len(snippets) == 1
+        assert "just joining us" in snippets[0]
+
+    def test_recap_suppressed_when_session_too_young(self, tmp_path):
+        mem = _make_memory(tmp_path)
+        self._prime_session(mem)
+        mem.records.session_started = time.time() - 60  # just started
+        mem._aired_count = RECAP_EVERY_N
+        mem._last_recap_at_count = 0
+        # Recap specifically must not appear (other snippet types may legitimately fire).
+        assert all("just joining us" not in s for s in mem.recall(None, {}))
+        assert mem._last_recap_at_count == 0  # recap counter not advanced
+
+    def test_recap_suppressed_when_too_quiet(self, tmp_path):
+        """Old session but nothing notable happened -> no recap worth giving."""
+        mem = _make_memory(tmp_path)
+        mem.records.session_started = time.time() - (RECAP_MIN_SESSION_S + 600)
+        mem._aired_count = RECAP_EVERY_N
+        mem._last_recap_at_count = 0
+        assert all("just joining us" not in s for s in mem.recall(None, {}))
+
+    def test_recap_not_due_before_interval(self, tmp_path):
+        mem = _make_memory(tmp_path)
+        self._prime_session(mem)
+        mem._aired_count = RECAP_EVERY_N - 1
+        mem._last_recap_at_count = 0
+        # Not yet due for a recap; with no featured focus there's nothing else.
+        assert all("just joining us" not in s for s in mem.recall(None, {}))
+
+    def test_recap_advances_counter(self, tmp_path):
+        mem = _make_memory(tmp_path)
+        self._prime_session(mem)
+        mem._aired_count = RECAP_EVERY_N
+        mem._last_recap_at_count = 0
+        mem.recall(None, {})
+        assert mem._last_recap_at_count == RECAP_EVERY_N
 
 
 # ── helper functions ──────────────────────────────────────────────────────────
