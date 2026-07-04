@@ -132,22 +132,31 @@ class LiveStreamer:
         self._stop.set()
 
     def _watchdog_loop(self) -> None:
-        """Force-kill ffmpeg if frame writes stall (e.g. RTMP socket hung on a
-        dead connection). This unblocks the frame thread's stuck stdin.write()
-        with a clean BrokenPipeError, letting the normal session-teardown and
-        supervisor-restart path recover instead of hanging forever."""
+        """Force a full process restart if frame writes stall (e.g. an RTMP
+        socket hung on a dead connection to YouTube).
+
+        Originally this just killed ffmpeg and relied on the frame thread's
+        blocked stdin.write() raising BrokenPipeError once the reader died, so
+        the normal session-teardown path could recover. In production that did
+        NOT reliably happen — the frame thread stayed stuck for 4+ minutes
+        after kill() with no automatic recovery, requiring a manual
+        `systemctl restart`. Rather than depend on that pipe-closing race,
+        exit the whole process unconditionally: systemd's Restart=always
+        brings a fresh process (new ffmpeg, new RTMP connection) back up
+        within seconds — verified reliable by that same manual restart.
+        """
         while not self._stop.wait(_WATCHDOG_POLL_S):
             stale_for = time.monotonic() - self._last_frame_write
             if stale_for > STALL_TIMEOUT_S:
                 log.error(
                     "frame writes stalled for %.0fs (ffmpeg not draining stdin — "
-                    "likely a stuck RTMP connection); killing ffmpeg to force a restart",
+                    "likely a stuck RTMP connection); forcing a full process restart",
                     stale_for,
                 )
                 if self._proc:
                     with contextlib.suppress(Exception):
                         self._proc.kill()
-                return
+                os._exit(1)  # unconditional — do not depend on any thread unblocking
 
     # ── ffmpeg command ────────────────────────────────────────
     def _ffmpeg_cmd(self, fifo: str) -> list[str]:
