@@ -658,9 +658,14 @@ class NativeRenderer:
                 if len(route_parts) == 2:
                     for lbl, name in [("From", route_parts[0].strip()),
                                       ("To",   route_parts[1].strip())]:
-                        # Truncate name until it fits the right-aligned value slot.
-                        while f_route.measureText(name) > max_val_w and len(name) > 4:
-                            name = name[:-2] + ".."
+                        # Truncate name until it fits the right-aligned value
+                        # slot. Guard against a non-converging loop: shrink by
+                        # one char at a time and stop once we can't shrink
+                        # further, so a tiny/negative max_val_w (narrow panel or
+                        # unexpected font metrics) can never spin forever.
+                        while (len(name) > 1
+                               and f_route.measureText(name) > max_val_w):
+                            name = name[:-1]
                         c.drawString(lbl, ix, iy, f_small,
                                      skia.Paint(Color=TEXT_DIM, AntiAlias=True))
                         nw = f_route.measureText(name)
