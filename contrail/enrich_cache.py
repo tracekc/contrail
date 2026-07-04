@@ -67,6 +67,17 @@ class EnrichmentCache:
         self._data["aircraft"][hex_.lower()] = {**data, "last_seen": time.time()}
         self._save()
 
+    def update_aircraft(self, hex_: str, patch: dict[str, Any]) -> None:
+        """Merge `patch` into an existing aircraft entry (or create one). Used to
+        retry just the photo without discarding cached adsbdb metadata."""
+        entry = self._data["aircraft"].get(hex_.lower())
+        if entry is None:
+            entry = {}
+            self._data["aircraft"][hex_.lower()] = entry
+        entry.update(patch)
+        entry["last_seen"] = time.time()
+        self._save()
+
     def get_route(self, callsign: str) -> Optional[dict]:
         entry = self._data["routes"].get(callsign.upper())
         if not entry:

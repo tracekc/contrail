@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from typing import TYPE_CHECKING, Optional
 
 from .data.aircraft_types import TYPE_NAMES
@@ -20,6 +21,13 @@ _PREFIX = re.compile(r"^([A-Z]{3})")
 
 _pending: set[str] = set()
 _pending_lock = threading.Lock()
+
+# Identify the app per Planespotters/adsbdb API etiquette — a descriptive
+# User-Agent with a contact URL reduces 403 throttling.
+_UA = "Contrail-Skywatch/1.0 (+https://github.com/tracekc/contrail)"
+# After an unresolved (failed/throttled) photo lookup, don't re-hit
+# Planespotters for the same airframe more often than this.
+PHOTO_RETRY_COOLDOWN = 600  # seconds
 
 
 def airline_for(callsign: str | None) -> str | None:
@@ -54,6 +62,40 @@ def enrich_all(aircraft: list[Aircraft]) -> list[Aircraft]:
 # ── External API enrichment (non-blocking, background threads) ────────────────
 
 
+def _fetch_photo(hex_: str) -> tuple[dict, bool]:
+    """Fetch a Planespotters photo for `hex_`.
+
+    Returns (photo_fields, resolved). `resolved` is True only on a definitive
+    HTTP 200 — whether or not it contained a photo, since a genuine "no photo
+    on file" is a real answer worth caching. On 403/timeout/error it is False,
+    so the lookup is retried later instead of cached permanently as "no photo"
+    (the bug that pinned the hit rate near 7%)."""
+    import requests
+
+    try:
+        r = requests.get(
+            f"https://api.planespotters.net/pub/photos/hex/{hex_}",
+            timeout=8, headers={"User-Agent": _UA},
+        )
+    except Exception as exc:
+        log.debug("planespotters lookup failed %s: %s", hex_, exc)
+        return {}, False
+    if r.status_code != 200:
+        log.debug("planespotters %s -> HTTP %s (will retry)", hex_, r.status_code)
+        return {}, False
+    try:
+        photos = r.json().get("photos") or []
+    except Exception:
+        return {}, False
+    if photos:
+        ph = photos[0]
+        return {
+            "photo_url": (ph.get("thumbnail_large") or {}).get("src"),
+            "photo_credit": ph.get("photographer"),
+        }, True
+    return {}, True  # genuine "no photo on file" — resolved, stop retrying
+
+
 def _fetch_aircraft_bg(hex_: str, cache: "EnrichmentCache", on_complete=None) -> None:
     """Background: fetch aircraft details from adsbdb + photo from planespotters."""
     import requests
@@ -62,7 +104,7 @@ def _fetch_aircraft_bg(hex_: str, cache: "EnrichmentCache", on_complete=None) ->
     try:
         r = requests.get(
             f"https://api.adsbdb.com/v0/aircraft/{hex_}",
-            timeout=8, headers={"User-Agent": "contrail-skywatch/1.0"},
+            timeout=8, headers={"User-Agent": _UA},
         )
         if r.status_code == 200:
             ac_info = (r.json().get("response") or {}).get("aircraft") or {}
@@ -73,19 +115,10 @@ def _fetch_aircraft_bg(hex_: str, cache: "EnrichmentCache", on_complete=None) ->
     except Exception as exc:
         log.debug("adsbdb aircraft lookup failed %s: %s", hex_, exc)
 
-    try:
-        r2 = requests.get(
-            f"https://api.planespotters.net/pub/photos/hex/{hex_}",
-            timeout=8, headers={"User-Agent": "contrail-skywatch/1.0"},
-        )
-        if r2.status_code == 200:
-            photos = r2.json().get("photos") or []
-            if photos:
-                ph = photos[0]
-                data["photo_url"] = (ph.get("thumbnail_large") or {}).get("src")
-                data["photo_credit"] = ph.get("photographer")
-    except Exception as exc:
-        log.debug("planespotters lookup failed %s: %s", hex_, exc)
+    photo_fields, resolved = _fetch_photo(hex_)
+    data.update(photo_fields)
+    data["photo_resolved"] = resolved
+    data["photo_tried_at"] = time.time()
 
     if data:
         cache.set_aircraft(hex_, data)
@@ -99,14 +132,43 @@ def _fetch_aircraft_bg(hex_: str, cache: "EnrichmentCache", on_complete=None) ->
         _pending.discard(f"ac:{hex_.lower()}")
 
 
-def lookup_aircraft(hex_: str, cache: "EnrichmentCache", on_complete=None) -> Optional[dict]:
-    """Return cached aircraft data immediately; fire background fetch if stale.
+def _fetch_photo_bg(hex_: str, cache: "EnrichmentCache", on_complete=None) -> None:
+    """Background: retry ONLY the Planespotters photo for an already-cached
+    airframe whose photo never resolved (e.g. an earlier 403). Merges into the
+    existing entry so the adsbdb metadata is preserved."""
+    photo_fields, resolved = _fetch_photo(hex_)
+    patch = {"photo_resolved": resolved, "photo_tried_at": time.time(), **photo_fields}
+    cache.update_aircraft(hex_, patch)
+    if photo_fields and on_complete:
+        try:
+            on_complete(cache.get_aircraft(hex_))
+        except Exception as exc:
+            log.debug("photo on_complete callback failed: %s", exc)
 
-    on_complete(data) is called from the background thread when a fresh fetch
-    lands — use it to push data into the UI without waiting for the next cycle.
+    with _pending_lock:
+        _pending.discard(f"ph:{hex_.lower()}")
+
+
+def lookup_aircraft(hex_: str, cache: "EnrichmentCache", on_complete=None) -> Optional[dict]:
+    """Return cached aircraft data immediately; fetch in the background on a miss.
+
+    If the entry exists but its photo never resolved (unknown airframe, or a
+    throttled/failed Planespotters call), fire a photo-only retry — rate-limited
+    per airframe by PHOTO_RETRY_COOLDOWN — so transient failures don't leave the
+    photo permanently blank. on_complete(data) is called from the background
+    thread when fresh data lands, to push it to the UI.
     """
     cached = cache.get_aircraft(hex_)
-    if cached:
+    if cached is not None:
+        unresolved = not cached.get("photo_url") and not cached.get("photo_resolved")
+        if unresolved and (time.time() - cached.get("photo_tried_at", 0)) >= PHOTO_RETRY_COOLDOWN:
+            key = f"ph:{hex_.lower()}"
+            with _pending_lock:
+                if key not in _pending:
+                    _pending.add(key)
+                    threading.Thread(
+                        target=_fetch_photo_bg, args=(hex_, cache, on_complete), daemon=True
+                    ).start()
         return cached
     key = f"ac:{hex_.lower()}"
     with _pending_lock:
@@ -125,7 +187,7 @@ def _fetch_route_bg(callsign: str, cache: "EnrichmentCache", on_complete=None) -
     try:
         r = requests.get(
             f"https://api.adsbdb.com/v0/callsign/{callsign}",
-            timeout=8, headers={"User-Agent": "contrail-skywatch/1.0"},
+            timeout=8, headers={"User-Agent": _UA},
         )
         if r.status_code != 200:
             return
