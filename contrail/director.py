@@ -199,8 +199,16 @@ class IncidentTracker:
 
 class Director:
     def __init__(self, client=None, memory=None) -> None:
-        self.model = os.getenv("LLM_MODEL_LIVE", "claude-haiku-4-5-20251001")
-        self._client = client  # injected anthropic.Anthropic (lazy if None)
+        # LLM_PROVIDER: anthropic (direct) | openrouter (OpenAI-compatible proxy
+        # to DeepSeek/Gemini/etc). Model id format follows whichever provider is
+        # selected (e.g. "claude-haiku-4-5-20251001" vs "google/gemini-2.5-flash-lite").
+        self.provider = os.getenv("LLM_PROVIDER", "openrouter").strip().lower()
+        default_model = (
+            "google/gemini-2.5-flash-lite" if self.provider == "openrouter"
+            else "claude-haiku-4-5-20251001"
+        )
+        self.model = os.getenv("LLM_MODEL_LIVE", default_model)
+        self._client = client  # injected client (lazy if None)
         self._memory = memory  # optional SessionMemory; None = no narrative memory
         self._recent: deque[str] = deque(maxlen=6)
         self._last_focus_hex: Optional[str] = None
@@ -414,27 +422,52 @@ class Director:
     # ── LLM call ──────────────────────────────────────────────
     def _ensure_client(self):
         if self._client is None:
-            import anthropic
+            if self.provider == "openrouter":
+                from openai import OpenAI
 
-            self._client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
+                self._client = OpenAI(
+                    base_url="https://openrouter.ai/api/v1",
+                    api_key=os.getenv("OPENROUTER_API_KEY"),
+                    default_headers={
+                        "HTTP-Referer": "https://github.com/tracekc/contrail",
+                        "X-Title": "Contrail Skywatch",
+                    },
+                )
+            else:
+                import anthropic
+
+                self._client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
         return self._client
 
     def _call_llm(self, user_prompt: str) -> Optional[str]:
         try:
             client = self._ensure_client()
-            resp = client.messages.create(
-                model=self.model,
-                max_tokens=220,
-                temperature=0.85,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            text = "".join(
-                block.text for block in resp.content if block.type == "text"
-            ).strip()
+            if self.provider == "openrouter":
+                resp = client.chat.completions.create(
+                    model=self.model,
+                    max_tokens=220,
+                    temperature=0.85,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+                text = (resp.choices[0].message.content or "").strip()
+            else:
+                resp = client.messages.create(
+                    model=self.model,
+                    max_tokens=220,
+                    temperature=0.85,
+                    system=SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+                text = "".join(
+                    block.text for block in resp.content if block.type == "text"
+                ).strip()
             return _clean(text) or None
         except Exception as exc:
-            log.warning("director LLM call failed: %s", exc)
+            log.warning("director LLM call failed (provider=%s model=%s): %s",
+                        self.provider, self.model, exc)
             return None
 
 
