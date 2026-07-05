@@ -170,13 +170,16 @@ class LiveStreamer:
             # size"), never starts draining stdin, and every frame write then
             # blocks on the full pipe buffer until the stall watchdog fires —
             # 100% reproducible, independent of fps or RTMP/network health.
-            "-f", "image2pipe", "-vcodec", "mjpeg", "-video_size", f"{WIDTH}x{HEIGHT}",
-            "-analyzeduration", "1000000", "-probesize", "1000000",
+            # Lossless raw RGBA frames from the Skia renderer — no JPEG pass, so
+            # H.264 is the only compression (crisper text/lines) and there's no
+            # per-frame encode cost. rawvideo has no header, so pixel_format +
+            # video_size + framerate are required on the input.
+            "-f", "rawvideo", "-pixel_format", "rgba", "-video_size", f"{WIDTH}x{HEIGHT}",
             "-framerate", str(self.fps), "-i", "pipe:0",
             # audio: raw PCM from the FIFO
             "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS), "-i", fifo,
-            "-c:v", "libx264", "-preset", "veryfast",
-            "-pix_fmt", "yuv420p", "-g", str(self.fps * 2), "-b:v", "4500k",
+            "-c:v", "libx264", "-preset", "faster",
+            "-pix_fmt", "yuv420p", "-g", str(self.fps * 2), "-b:v", "6000k",
             "-c:a", "aac", "-b:a", "128k", "-ar", str(SAMPLE_RATE),
         ]
         if self.target == "rtmp":
@@ -222,7 +225,7 @@ class LiveStreamer:
                 if end and time.monotonic() >= end:
                     break
                 renderer.poll_state(STATE_JSON)
-                frame = renderer.render_frame(quality=92)
+                frame = renderer.render_raw()
                 try:
                     self._proc.stdin.write(frame)
                 except (BrokenPipeError, ValueError):

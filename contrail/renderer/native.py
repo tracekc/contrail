@@ -880,7 +880,8 @@ class NativeRenderer:
         c.restore()
 
     # ── public: produce one frame ────────────────────────────────────
-    def render_frame(self, now_ms: Optional[float] = None, quality: int = 75) -> bytes:
+    def _render_scene(self, now_ms: Optional[float] = None) -> None:
+        """Advance the camera and draw base + markers + chrome to self.surface."""
         now = time.monotonic() * 1000 if now_ms is None else now_ms
         self._update_camera(now)
         # chase-cam: once zoom-in completes, pin focus aircraft to center
@@ -892,13 +893,30 @@ class NativeRenderer:
                 self.current_view = {"lon": fp_lon, "lat": fp_lat, "scale": self.chase_scale}
             else:
                 self.chase_key = None
-
         c = self.surface.getCanvas()
         self._draw_base(c)
         self._draw_markers(c, now)
         self._draw_chrome(c, now)
+
+    def render_frame(self, now_ms: Optional[float] = None, quality: int = 75) -> bytes:
+        """JPEG-encoded frame (used by the local MP4 smoke test / benchmarks)."""
+        self._render_scene(now_ms)
         img = self.surface.makeImageSnapshot()
         return bytes(img.encodeToData(skia.kJPEG, quality))
+
+    def render_raw(self, now_ms: Optional[float] = None) -> bytes:
+        """Raw RGBA pixel bytes for the live pipe — lossless, so ffmpeg's H.264
+        is the only compression pass (no JPEG generation to soften text/lines).
+        Also cheaper than JPEG: no per-frame image encode."""
+        self._render_scene(now_ms)
+        info = skia.ImageInfo.Make(WIDTH, HEIGHT, skia.ColorType.kRGBA_8888_ColorType,
+                                   skia.AlphaType.kOpaque_AlphaType)
+        buf = bytearray(WIDTH * HEIGHT * 4)
+        if not self.surface.readPixels(info, buf, WIDTH * 4, 0, 0):
+            # extremely unlikely; fall back to a JPEG-decoded path would be wrong
+            # for a rawvideo pipe, so just return zeros (one dark frame).
+            pass
+        return bytes(buf)
 
 
 if __name__ == "__main__":
