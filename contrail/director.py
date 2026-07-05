@@ -16,9 +16,29 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .data.reference import SQUAWK_EMERGENCY, SQUAWK_RADIO_FAIL
+from .enrich import lookup_aircraft, lookup_route
 from .models import Aircraft, StoryCandidate
 
 log = logging.getLogger(__name__)
+
+_COMPASS = ("north", "north-east", "east", "south-east",
+            "south", "south-west", "west", "north-west")
+
+
+def _compass(deg: float) -> str:
+    return _COMPASS[int((deg % 360) / 45 + 0.5) % 8]
+
+
+# ADS-B emitter categories worth mentioning (skip A0/unknown & non-fixed-wing noise).
+_CATEGORY = {
+    "A1": "light aircraft", "A2": "small aircraft", "A3": "large jet",
+    "A4": "large high-wake jet", "A5": "heavy jet",
+    "A6": "high-performance aircraft", "A7": "rotorcraft",
+}
+
+
+def _category_label(cat: Optional[str]) -> Optional[str]:
+    return _CATEGORY.get((cat or "").upper())
 
 # Pre-import the LLM client SDKs at module load (process startup, before the
 # stream launches) so their slow import cost isn't paid on the first narration
@@ -211,7 +231,7 @@ class IncidentTracker:
 
 
 class Director:
-    def __init__(self, client=None, memory=None) -> None:
+    def __init__(self, client=None, memory=None, enrich_cache=None) -> None:
         # LLM_PROVIDER: anthropic (direct) | openrouter (OpenAI-compatible proxy
         # to DeepSeek/Gemini/etc). Model id format follows whichever provider is
         # selected (e.g. "claude-haiku-4-5-20251001" vs "google/gemini-2.5-flash-lite").
@@ -223,6 +243,7 @@ class Director:
         self.model = os.getenv("LLM_MODEL_LIVE", default_model)
         self._client = client  # injected client (lazy if None)
         self._memory = memory  # optional SessionMemory; None = no narrative memory
+        self._enrich = enrich_cache  # optional EnrichmentCache for route/age/operator
         self._recent: deque[str] = deque(maxlen=6)
         self._last_focus_hex: Optional[str] = None
         self._last_ambient_kind: Optional[str] = None
@@ -385,22 +406,49 @@ class Director:
 
         ac = focus.aircraft
         if ac:
-            lines.append("\nFOCUS AIRCRAFT:")
+            # Pull enriched route / age / registered operator (cached; a miss
+            # fires a background fetch and simply isn't included this line).
+            ac_data = (lookup_aircraft(ac.hex, self._enrich)
+                       if (self._enrich and ac.hex) else None) or {}
+            rt_data = (lookup_route(ac.callsign, self._enrich)
+                       if self._enrich else None) or {}
+
+            lines.append("\nFOCUS AIRCRAFT (use only what fits naturally — you may "
+                         "ignore fields):")
             lines.append(f"- callsign: {ac.callsign or 'unknown'}")
-            if ac.airline:
-                lines.append(f"- operator: {ac.airline}")
+            # Prefer the enriched registered operator over the callsign-prefix guess.
+            operator = ac_data.get("operator") or ac.airline
+            if operator:
+                lines.append(f"- operator: {operator}")
             if ac.type_desc:
                 lines.append(f"- type: {ac.type_desc}")
-            # Registration is shown on the on-screen panel, not spoken: the model
-            # tends to spell it out letter-by-letter, which sounds robotic. Keep
-            # it out of the prompt.
+            cat = _category_label(ac.category)
+            if cat:
+                lines.append(f"- size class: {cat}")
+            if ac.registration and ac.registration != ac.callsign:
+                lines.append(f"- registration: {ac.registration} "
+                             "(refer to it as a whole, never spell it out letter by letter)")
+            built = ac_data.get("built_year")
+            if built:
+                age = time.gmtime().tm_year - int(built)
+                if 0 <= age < 80:
+                    lines.append(f"- age: about {age} years old (built {built})")
+            # Route (origin -> destination), from enrichment.
+            o = rt_data.get("origin_name") or rt_data.get("origin_iata")
+            d = rt_data.get("dest_name") or rt_data.get("dest_iata")
+            if o and d:
+                lines.append(f"- route: {o} -> {d}")
             if ac.altitude is not None:
                 lines.append(f"- altitude: {ac.altitude} ft")
             if ac.ground_speed is not None:
                 lines.append(f"- ground speed: {ac.ground_speed:.0f} kt")
+            if ac.track is not None:
+                lines.append(f"- heading: {_compass(ac.track)}")
             if ac.vertical_rate is not None and abs(ac.vertical_rate) >= 500:
                 verb = "climbing" if ac.vertical_rate > 0 else "descending"
                 lines.append(f"- {verb} at {abs(ac.vertical_rate)} ft/min")
+            if ac.distance_nm is not None:
+                lines.append(f"- distance from our coverage centre: {ac.distance_nm:.0f} nm")
             # Only surface the squawk when it signals an emergency.
             sq = focus.detail.get("squawk") or ac.squawk
             meaning = {

@@ -348,7 +348,7 @@ def _pipeline_loop(stop: threading.Event, cfg: Config, *, silent: bool,
     detector = EventDetector()
     memory = SessionMemory()
     memory.load()
-    director = Director(memory=memory)
+    director = Director(memory=memory, enrich_cache=_enrich_cache)
     narrator = None if silent else Narrator()
     _last_memory_save = time.time()
     _MEMORY_SAVE_INTERVAL = 300  # save memory every 5 minutes
