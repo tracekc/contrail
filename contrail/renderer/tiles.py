@@ -28,11 +28,21 @@ log = logging.getLogger(__name__)
 TILE = 256
 _CACHE_DIR = Path(__file__).parent / "tile_cache"
 _UA = "contrail-skywatch/1.0 (+github.com/tracekc/contrail)"
-_URL_TEMPLATE = os.getenv(
-    "TILE_URL_TEMPLATE",
-    "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-)
+
+# Dark raster source. Prefer Stadia (Alidade Smooth Dark) when a key is set;
+# otherwise fall back to CARTO dark for keyless local testing. Override the
+# whole URL with TILE_URL_TEMPLATE if needed. `.format` ignores unused fields,
+# so one call fills {s}/{z}/{x}/{y}/{key} regardless of which the template uses.
+_TILE_KEY = os.getenv("STADIA_API_KEY", "").strip()
+_STADIA = "https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}.png?api_key={key}"
+_CARTO = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
+_URL_TEMPLATE = os.getenv("TILE_URL_TEMPLATE") or (_STADIA if _TILE_KEY else _CARTO)
 _SUBDOMAINS = "abc"
+
+# Attribution string for the active source — must be shown on-screen.
+ATTRIBUTION = ("© Stadia Maps © OpenMapTiles © OpenStreetMap"
+               if (_TILE_KEY or "stadiamaps" in _URL_TEMPLATE)
+               else "© CARTO © OpenStreetMap")
 
 _MEM_MAX = 320       # decoded tiles held in RAM (a viewport is ~24, + margin/history)
 _DISK_MAX = 8000     # PNGs kept on disk before LRU eviction (~ a few hundred MB)
@@ -137,7 +147,7 @@ class TileProvider:
                 z, x, y = self._stack.pop()  # newest first (LIFO)
             try:
                 url = self._url.format(s=_SUBDOMAINS[(x + y) % len(_SUBDOMAINS)],
-                                       z=z, x=x, y=y)
+                                       z=z, x=x, y=y, key=_TILE_KEY)
                 r = requests.get(url, timeout=10, headers={"User-Agent": _UA})
                 if r.status_code == 200 and r.content:
                     self._dir.mkdir(parents=True, exist_ok=True)

@@ -842,6 +842,13 @@ class NativeRenderer:
         caption = _safe(st.get("caption") or "Standing by for live traffic.")
         c.drawString(caption, desk_w + 16, strip_y + 25, f_caption, skia.Paint(Color=WHITE, AntiAlias=True))
 
+        # ---- Basemap attribution (required by the tile provider's terms) ----
+        if self._basemap_tiles:
+            f_attr = _font(9)
+            aw = f_attr.measureText(tiles.ATTRIBUTION)
+            c.drawString(tiles.ATTRIBUTION, WIDTH - 10 - aw, strip_y - 6, f_attr,
+                         skia.Paint(Color=_c("#9fb0c8", 200), AntiAlias=True))
+
         # ---- Alerts ticker (very bottom, scrolling) ----
         ty0 = HEIGHT - 28
         c.drawRect(skia.Rect.MakeXYWH(0, ty0, WIDTH, 28), skia.Paint(Color=TICKER_BG))
