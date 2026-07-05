@@ -26,10 +26,15 @@ from typing import Any, Optional
 
 import skia
 
+from . import tiles
+
 WIDTH, HEIGHT = 1280, 720
 SCENE_DIR = Path(__file__).parent
 WORLD_CACHE = SCENE_DIR / "countries-110m.json"
 WORLD_URL = "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json"
+
+# Web-Mercator basemap zoom bounds (Phase A, flag-gated via BASEMAP=tiles).
+MIN_TILE_Z, MAX_TILE_Z = 2, 12
 
 # ── constants mirrored from scene.html ───────────────────────────────
 MAP_PADDING = 20
@@ -223,10 +228,48 @@ class _Projection:
         return lon, lat
 
 
+# ── projection (Web Mercator, for the raster-tile basemap) ───────────
+class _MercatorProjection:
+    """Same interface as _Projection but Web Mercator, so aircraft markers land
+    on the same coordinate system as the map tiles. `scale` here means world_px
+    (the pixel width of the whole world = 2**zoom * 256), so the camera-fit and
+    tween math in NativeRenderer works unchanged."""
+
+    def __init__(self) -> None:
+        self.center_lon = 0.0
+        self.center_lat = 0.0
+        self.world_px = float(tiles.world_px_for_zoom(3))
+
+    @property
+    def scale(self) -> float:  # alias for interface compatibility
+        return self.world_px
+
+    def center_px(self) -> tuple[float, float]:
+        return (tiles.lon_to_norm(self.center_lon) * self.world_px,
+                tiles.lat_to_norm(self.center_lat) * self.world_px)
+
+    def project(self, lon: float, lat: float) -> tuple[float, float]:
+        gx = tiles.lon_to_norm(lon) * self.world_px
+        gy = tiles.lat_to_norm(lat) * self.world_px
+        cgx, cgy = self.center_px()
+        return (gx - cgx + WIDTH / 2, gy - cgy + HEIGHT / 2)
+
+    def set_camera(self, lon: float, lat: float, scale: float) -> None:
+        self.center_lon, self.center_lat, self.world_px = lon, lat, float(scale)
+
+    def invert_center(self) -> tuple[float, float]:
+        return self.center_lon, self.center_lat
+
+
 class NativeRenderer:
     def __init__(self) -> None:
         self.world = _load_world()
-        self.proj = _Projection()
+        # BASEMAP=tiles switches to a Web Mercator projection + raster tile
+        # basemap. Default (unset) keeps the equirectangular country-outline map,
+        # so the live stream is unaffected until the flag is set.
+        self._basemap_tiles = os.getenv("BASEMAP", "").strip().lower() == "tiles"
+        self.proj = _MercatorProjection() if self._basemap_tiles else _Projection()
+        self.tiles = tiles.TileProvider() if self._basemap_tiles else None
         self.surface = skia.Surface(WIDTH, HEIGHT)
 
         # Cached base map (bg + graticule + land). Rendered into an oversized
@@ -265,6 +308,16 @@ class NativeRenderer:
             west, south, east, north = -180, -58, 180, 78  # ~land extent
         else:
             west, south, east, north = -180, -85, 180, 85
+        if self._basemap_tiles:
+            # Mercator fit: world_px that makes the bbox fill the padded viewport.
+            nx = abs(tiles.lon_to_norm(east) - tiles.lon_to_norm(west)) or 1e-9
+            ny = abs(tiles.lat_to_norm(south) - tiles.lat_to_norm(north)) or 1e-9
+            world_px = min((WIDTH - 2 * MAP_PADDING) / nx, (HEIGHT - 2 * MAP_PADDING) / ny)
+            world_px = max(float(tiles.world_px_for_zoom(MIN_TILE_Z)),
+                           min(world_px, float(tiles.world_px_for_zoom(MAX_TILE_Z))))
+            clon, clat = (west + east) / 2, (south + north) / 2
+            self.proj.set_camera(clon, clat, world_px)
+            return {"lon": clon, "lat": clat, "scale": world_px}
         span_lon = math.radians(east) - math.radians(west)
         span_lat = math.radians(north) - math.radians(south)
         avail_x = WIDTH - 2 * MAP_PADDING
@@ -419,10 +472,41 @@ class NativeRenderer:
             self._apply_bounds(cam, now)
 
     # ── drawing ──────────────────────────────────────────────────────
+    def _draw_basemap_tiles(self, c: skia.Canvas) -> None:
+        """Composite Web-Mercator raster tiles as the base layer. Only draws
+        tiles already cached (TileProvider.get never blocks); any not-yet-fetched
+        tile is left as dark background and fills in on a later frame."""
+        c.clear(BG)
+        if self.tiles is None:
+            return
+        wp = self.proj.world_px
+        z = max(MIN_TILE_Z, min(MAX_TILE_Z, int(round(math.log2(wp / tiles.TILE)))))
+        step = tiles.TILE * (wp / float(tiles.world_px_for_zoom(z)))  # on-screen tile size
+        cgx, cgy = self.proj.center_px()
+        ox, oy = cgx - WIDTH / 2, cgy - HEIGHT / 2
+        n = 2 ** z
+        sampling = skia.SamplingOptions(skia.FilterMode.kLinear)
+        src = skia.Rect.MakeWH(tiles.TILE, tiles.TILE)
+        tx0, tx1 = int(math.floor(ox / step)), int(math.floor((ox + WIDTH) / step))
+        ty0, ty1 = int(math.floor(oy / step)), int(math.floor((oy + HEIGHT) / step))
+        for tx in range(tx0, tx1 + 1):
+            wx = (tx % n + n) % n  # wrap longitude
+            for ty in range(ty0, ty1 + 1):
+                if ty < 0 or ty >= n:
+                    continue
+                img = self.tiles.get(z, wx, ty)
+                if img is None:
+                    continue
+                dst = skia.Rect.MakeXYWH(tx * step - ox, ty * step - oy, step, step)
+                c.drawImageRect(img, src, dst, sampling, None)
+
     def _draw_base(self, c: skia.Canvas) -> None:
         """Paint the base map onto the frame canvas, using the cached oversized
         base when the zoom is stable (overview + chase-cam) and only re-rendering
         the world during a scale-changing camera transition."""
+        if self._basemap_tiles:
+            self._draw_basemap_tiles(c)
+            return
         scale, tx, ty = self.proj.scale, self.proj.tx, self.proj.ty
 
         # Mid-transition the zoom changes every frame, so a pan-blit can't stand

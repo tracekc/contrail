@@ -28,3 +28,6 @@ contrail/memory_store.json
 
 # Large downloadable models (see README for how to fetch)
 voices/*.onnx
+contrail/renderer/tile_cache/
+experiments/tile_cache/
+experiments/*.png
