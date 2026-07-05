@@ -270,6 +270,17 @@ class NativeRenderer:
         self._basemap_tiles = os.getenv("BASEMAP", "").strip().lower() == "tiles"
         self.proj = _MercatorProjection() if self._basemap_tiles else _Projection()
         self.tiles = tiles.TileProvider() if self._basemap_tiles else None
+        # Darken the tiles to a consistent near-black regardless of the source
+        # style's zoom-dependent brightness (Alidade Smooth Dark, e.g., lightens
+        # to grey at city zoom). Multiply-blend by a dim cool-grey; TILE_DIM
+        # (0..1) tunes it (lower = darker). Slight blue bias matches the UI.
+        self._tile_paint = None
+        if self._basemap_tiles:
+            d = max(0.0, min(1.0, float(os.getenv("TILE_DIM", "0.45"))))
+            mult = skia.Color(int(255 * d), int(255 * d), int(255 * min(1.0, d * 1.12)))
+            self._tile_paint = skia.Paint(
+                ColorFilter=skia.ColorFilters.Blend(mult, skia.BlendMode.kModulate),
+                AntiAlias=True)
         self.surface = skia.Surface(WIDTH, HEIGHT)
 
         # Cached base map (bg + graticule + land). Rendered into an oversized
@@ -498,7 +509,7 @@ class NativeRenderer:
                 if img is None:
                     continue
                 dst = skia.Rect.MakeXYWH(tx * step - ox, ty * step - oy, step, step)
-                c.drawImageRect(img, src, dst, sampling, None)
+                c.drawImageRect(img, src, dst, sampling, self._tile_paint)
 
     def _draw_base(self, c: skia.Canvas) -> None:
         """Paint the base map onto the frame canvas, using the cached oversized

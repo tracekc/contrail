@@ -49,6 +49,9 @@ _DISK_MAX = 8000     # PNGs kept on disk before LRU eviction (~ a few hundred MB
 _N_WORKERS = 3       # parallel fetch threads
 _MAX_QUEUE = 160     # cap pending fetches; a camera zoom-tween can request tiles
                      # across many zooms in seconds — keep only the newest.
+_NEG_COOLDOWN = 45   # secs before retrying a failed tile (never cache a failure
+                     # permanently — that turned a transient throttle into a
+                     # permanent dark square).
 
 
 # ── mercator math ─────────────────────────────────────────────────────────────
@@ -86,11 +89,17 @@ class TileProvider:
         if not (0 <= x < n and 0 <= y < n):
             return None
         key = (z, x, y)
+        now = time.time()
         with self._lock:
-            img = self._mem.get(key, "miss")
-            if img != "miss":
-                self._mem.move_to_end(key)
-                return img  # decoded image, or None if a prior fetch failed
+            entry = self._mem.get(key)
+            if entry is not None:
+                if isinstance(entry, skia.Image):
+                    self._mem.move_to_end(key)
+                    return entry
+                # negative sentinel = a retry-after timestamp
+                if now < entry:
+                    return None            # still cooling down; draw dark
+                del self._mem[key]         # cooldown elapsed — allow a refetch
 
         # Not in memory — try disk (fast, safe to do inline).
         p = self._tile_path(z, x, y)
@@ -99,10 +108,16 @@ class TileProvider:
                 img = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(p.read_bytes()))
             except Exception:
                 img = None
-            self._remember(key, img)
-            return img
+            if img is not None:
+                self._remember(key, img)
+                return img
+            # corrupt file on disk — drop it so a refetch can replace it
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
-        # Disk miss — enqueue a background fetch and draw dark for now.
+        # Miss (or expired negative) — enqueue a background fetch, draw dark now.
         self._enqueue(key)
         return None
 
@@ -115,6 +130,15 @@ class TileProvider:
     def _remember(self, key, img) -> None:
         with self._lock:
             self._mem[key] = img
+            self._mem.move_to_end(key)
+            while len(self._mem) > _MEM_MAX:
+                self._mem.popitem(last=False)
+
+    def _remember_negative(self, key) -> None:
+        """Cache a short-lived 'failed, retry after' marker (a timestamp), so a
+        transient fetch failure draws dark briefly but recovers on its own."""
+        with self._lock:
+            self._mem[key] = time.time() + _NEG_COOLDOWN
             self._mem.move_to_end(key)
             while len(self._mem) > _MEM_MAX:
                 self._mem.popitem(last=False)
@@ -145,29 +169,35 @@ class TileProvider:
                 while not self._stack:
                     self._cv.wait()
                 z, x, y = self._stack.pop()  # newest first (LIFO)
+            key = (z, x, y)
+            ok = False
             try:
                 url = self._url.format(s=_SUBDOMAINS[(x + y) % len(_SUBDOMAINS)],
                                        z=z, x=x, y=y, key=_TILE_KEY)
                 r = requests.get(url, timeout=10, headers={"User-Agent": _UA})
                 if r.status_code == 200 and r.content:
-                    self._dir.mkdir(parents=True, exist_ok=True)
-                    tmp = self._tile_path(z, x, y).with_suffix(".png.tmp")
-                    tmp.write_bytes(r.content)
-                    os.replace(tmp, self._tile_path(z, x, y))
                     try:
                         img = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(r.content))
                     except Exception:
                         img = None
-                    self._remember((z, x, y), img)
-                    self._evict_disk_if_needed()
+                    if img is not None:
+                        self._dir.mkdir(parents=True, exist_ok=True)
+                        tmp = self._tile_path(z, x, y).with_suffix(".png.tmp")
+                        tmp.write_bytes(r.content)
+                        os.replace(tmp, self._tile_path(z, x, y))
+                        self._remember(key, img)
+                        self._evict_disk_if_needed()
+                        ok = True
                 else:
                     log.debug("tile %s/%s/%s -> HTTP %s", z, x, y, r.status_code)
                 time.sleep(0.03)  # be polite to the tile server
             except Exception as exc:
                 log.debug("tile fetch %s/%s/%s failed: %s", z, x, y, exc)
             finally:
+                if not ok:
+                    self._remember_negative(key)  # retry after cooldown, not forever
                 with self._lock:
-                    self._pending.discard((z, x, y))
+                    self._pending.discard(key)
 
     _evict_counter = 0
 
