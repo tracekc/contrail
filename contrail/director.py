@@ -425,9 +425,8 @@ class Director:
             cat = _category_label(ac.category)
             if cat:
                 lines.append(f"- size class: {cat}")
-            if ac.registration and ac.registration != ac.callsign:
-                lines.append(f"- registration: {ac.registration} "
-                             "(refer to it as a whole, never spell it out letter by letter)")
+            # Registration intentionally omitted — a tail number adds little to the
+            # spoken line and tempts letter-by-letter spelling; it stays panel-only.
             built = ac_data.get("built_year")
             if built:
                 age = time.gmtime().tm_year - int(built)
